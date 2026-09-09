@@ -233,7 +233,7 @@ impl Session {
                     );
                     (
                         Answer::Complete("INSERT 0 1".to_string()),
-                        Event::Inserted(Arrived::new(origin, value.into_bytes())),
+                        Event::Inserted(Arrived::new(origin, crate::bytea::column_bytes(value))),
                     )
                 }
                 None => (
