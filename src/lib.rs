@@ -9,7 +9,9 @@
 //! inserts, an integrator polls. A Receive Location runs its query — `SELECT
 //! id, payload FROM inbox ORDER BY id` unless told otherwise — and hands
 //! each row up; a Send Location inserts the Stream as one column of one
-//! row. What is spoken is the frontend/backend protocol, version 3.0, in
+//! row — as text when the Stream is UTF-8 without a NUL, in the bytea hex
+//! form otherwise, and a value in that form is the bytes again on the way
+//! back (`bytea.rs`). What is spoken is the frontend/backend protocol, version 3.0, in
 //! its simple query flow, on port 5432: startup, trust or a cleartext
 //! password, `Query`, rows as text, `Terminate`. MD5 and SCRAM are not
 //! implemented and a server that asks for them is told so; TLS is the
@@ -30,6 +32,7 @@
 //! configured server and database.
 
 pub mod backend;
+pub mod bytea;
 pub mod client;
 pub mod frontend;
 pub mod session;
@@ -174,32 +177,29 @@ impl Transport for PostgresTransport {
                 .cloned()
                 .flatten()
                 .unwrap_or_else(|| index.to_string());
-            let bytes = row.last().cloned().flatten().unwrap_or_default();
+            let value = row.last().cloned().flatten().unwrap_or_default();
             arrived.push(Arrived::new(
                 format!("postgresql://{}/{}?row={name}", self.server, self.database),
-                bytes.into_bytes(),
+                bytea::column_bytes(value),
             ));
         }
         Ok(arrived)
     }
 
-    /// Insert the bytes as one text column of one row.
+    /// Insert the bytes as one column of one row: text as text, anything
+    /// else in the bytea hex form.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
         let (server, database, table, column) = self.resolve(target)?;
-        let text = std::str::from_utf8(bytes).map_err(|_| {
-            TransportError::permanent("a Stream that is not UTF-8 cannot be a text column")
-        })?;
-        if text.contains('\0') {
-            return Err(TransportError::permanent(
-                "a Stream with a NUL cannot be a text column",
-            ));
-        }
+        let literal = match std::str::from_utf8(bytes) {
+            Ok(text) if bytea::is_text(bytes) => quote_literal(text),
+            _ => quote_literal(&bytea::hex_literal(bytes)),
+        };
         let mut client = self.connect_to(server, database)?;
         let sql = format!(
             "INSERT INTO {} ({}) VALUES ({})",
             quote_identifier(table),
             quote_identifier(column),
-            quote_literal(text)
+            literal
         );
         client.execute(&sql)?;
         client.close()
@@ -274,13 +274,13 @@ mod tests {
                 b"it's here",
             )?;
             near.send("outbox/body", b"")?;
-            let binary = near.send(&format!("{address}/orders/inbox/payload"), &[0xff, 0xfe]);
+            near.send(&format!("{address}/orders/inbox/payload"), &[0xff, 0xfe])?;
             let bad_target = near.send("postgres://host/only-one", b"x");
             let refused = PostgresTransport::new(address, "xmip", "orders")
                 .with_password("wrong")
                 .timing_out_after(secs(2))
                 .send("inbox/payload", b"x");
-            Ok::<_, TransportError>((binary, bad_target, refused))
+            Ok::<_, TransportError>((bad_target, refused))
         });
         let mut session = far_end.accept_one(&listener).expect("accepting");
         let first = session.next_insert().expect("first").expect("one");
@@ -291,10 +291,16 @@ mod tests {
         let second = session.next_insert().expect("second").expect("one");
         assert!(second.bytes.is_empty());
         assert!(second.origin_uri.ends_with("/orders/outbox/body"));
+        let mut session = far_end.accept_one(&listener).expect("third");
+        let binary = session.next_insert().expect("third").expect("one");
+        assert_eq!(
+            binary.bytes,
+            [0xff, 0xfe],
+            "not text, so the bytea hex form"
+        );
         let error = far_end.accept_one(&listener).err().expect("wrong password");
         assert!(error.message.contains("password authentication failed"));
-        let (binary, bad_target, refused) = sender.join().expect("thread").expect("sending");
-        assert!(!binary.expect_err("not text").retryable);
+        let (bad_target, refused) = sender.join().expect("thread").expect("sending");
         assert!(!bad_target.expect_err("not a column").retryable);
         let refused = refused.expect_err("wrong password");
         assert!(!refused.retryable);
