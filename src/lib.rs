@@ -44,13 +44,21 @@ use std::time::Duration;
 pub use client::{Client, QueryResult, quote_identifier, quote_literal};
 pub use session::{Answer, Event, Session};
 use transport::claim::{NoNativeClaim, ResourceClaim};
-use transport::error::{Result, TransportError};
+use transport::error::{Result, TransportError, protocol_error};
+use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
 use transport::{Arrived, Directions, Transport};
 
 /// What a Receive Location runs unless told otherwise.
 pub const DEFAULT_QUERY: &str = "SELECT id, payload FROM inbox ORDER BY id";
 
+/// What the loopback pair agrees on: one user logged in by trust to one
+/// database, one table and column the payload is inserted into.
+const LOOPBACK_USER: &str = "probe";
+const LOOPBACK_DATABASE: &str = "probe";
+const LOOPBACK_TARGET: &str = "probe/payload";
+
+#[derive(Clone)]
 pub struct PostgresTransport {
     server: String,
     user: String,
@@ -212,6 +220,63 @@ impl Transport for PostgresTransport {
     }
 }
 
+impl PostgresTransport {
+    /// Both ends on this machine: an ephemeral local port, a login by
+    /// trust, the loopback timeout.
+    #[must_use]
+    pub fn loopback() -> Self {
+        Self::new("127.0.0.1:0", LOOPBACK_USER, LOOPBACK_DATABASE)
+            .timing_out_after(LOOPBACK_TIMEOUT)
+    }
+}
+
+/// A bound listener waiting for its one client: logged in, one INSERT
+/// taken as the Stream, its Terminate read.
+struct Listening {
+    transport: PostgresTransport,
+    listener: TcpListener,
+    address: String,
+}
+
+impl FarEnd for Listening {
+    fn address(&self) -> &str {
+        &self.address
+    }
+
+    fn take_one(self: Box<Self>) -> Result<Arrived> {
+        let mut session = self.transport.accept_one(&self.listener)?;
+        let arrived = session
+            .next_insert()?
+            .ok_or_else(|| protocol_error("the client closed without inserting"))?;
+        // Read the Terminate that follows, so the goodbye is taken rather
+        // than written into a closed socket.
+        session.next_insert()?;
+        Ok(arrived)
+    }
+}
+
+impl Loopback for PostgresTransport {
+    fn far_end(&self) -> Result<Box<dyn FarEnd>> {
+        let (listener, address) = self.bind()?;
+        Ok(Box::new(Listening {
+            transport: self.clone(),
+            listener,
+            address,
+        }))
+    }
+
+    /// INSERT the payload as one column of one row — text as text, anything
+    /// else in the bytea hex form — from a fresh near end logging in to
+    /// `address` as this transport does.
+    fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
+        let near = Self {
+            server: address.to_string(),
+            ..self.clone()
+        };
+        near.send(LOOPBACK_TARGET, payload)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,5 +398,41 @@ mod tests {
         let error = near.connect().err().expect("no password configured");
         assert!(error.message.contains("none is configured"));
         assert!(!near.connect().err().expect("not the protocol").retryable);
+    }
+
+    #[test]
+    fn the_loopback_inserts_text_and_bytes_through_its_own_session() {
+        let pair = PostgresTransport::loopback();
+        let arrived = pair.round(b"it's here").expect("round");
+        assert_eq!(arrived.bytes, b"it's here");
+        assert!(arrived.origin_uri.starts_with("postgresql://127.0.0.1:"));
+        assert!(arrived.origin_uri.ends_with("/probe/probe/payload"));
+        let binary = pair.round(&[0xff, 0xfe]).expect("the bytea hex form");
+        assert_eq!(binary.bytes, [0xff, 0xfe]);
+        assert_eq!(pair.name(), "postgresql");
+        assert_eq!(pair.ceiling(), None);
+    }
+
+    /// The Playground's edge payloads, written here so the crate does not
+    /// depend on it.
+    fn edge_payloads() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("empty", Vec::new()),
+            ("one byte", vec![0x2a]),
+            ("every byte", (0..=255).collect()),
+            ("nul run", vec![0; 512]),
+            ("high bytes", vec![0xff; 512]),
+            ("crlf storm", b"\r\n".repeat(400)),
+        ]
+    }
+
+    #[test]
+    fn the_loopback_returns_the_edge_payloads_whole() {
+        let pair = PostgresTransport::loopback();
+        for (name, payload) in edge_payloads() {
+            assert!(pair.refuses(&payload).is_none(), "{name}");
+            let arrived = pair.round(&payload).expect(name);
+            assert_eq!(arrived.bytes, payload, "{name}");
+        }
     }
 }
