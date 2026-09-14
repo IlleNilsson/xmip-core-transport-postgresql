@@ -14,6 +14,7 @@ use std::time::Duration;
 use transport::Arrived;
 use transport::error::{Result, TransportError, classify, protocol_error};
 use transport::socket;
+use transport::sql::{self, Answering, Inserted, Rows};
 
 use crate::backend::{Backend, encode_backend};
 use crate::frontend::{Frontend, read_frontend, read_startup};
@@ -30,6 +31,15 @@ pub enum Event {
     Executed(String),
 }
 
+impl Inserted for Event {
+    fn inserted(self) -> Option<Arrived> {
+        match self {
+            Self::Inserted(arrived) => Some(arrived),
+            Self::Selected(_) | Self::Executed(_) => None,
+        }
+    }
+}
+
 /// How a query is answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Answer {
@@ -44,8 +54,6 @@ pub enum Answer {
     },
 }
 
-type Answering = Box<dyn FnMut(&str) -> Option<Answer> + Send>;
-
 pub struct Session {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
@@ -53,8 +61,8 @@ pub struct Session {
     user: String,
     database: String,
     columns: Vec<String>,
-    rows: Vec<Vec<Option<String>>>,
-    answering: Option<Answering>,
+    rows: Rows<String>,
+    answering: Option<Answering<Answer>>,
 }
 
 impl Session {
@@ -151,11 +159,7 @@ impl Session {
     /// Answer any SELECT with these `columns` and `rows`.
     #[must_use]
     pub fn with_table(mut self, columns: &[&str], rows: &[&[Option<&str>]]) -> Self {
-        self.columns = columns.iter().map(ToString::to_string).collect();
-        self.rows = rows
-            .iter()
-            .map(|row| row.iter().map(|v| v.map(String::from)).collect())
-            .collect();
+        (self.columns, self.rows) = sql::table(columns, rows);
         self
     }
 
@@ -176,13 +180,7 @@ impl Session {
     /// # Errors
     /// Where the connection broke, or nothing arrived before the timeout.
     pub fn next_insert(&mut self) -> Result<Option<Arrived>> {
-        loop {
-            match self.next_event()? {
-                Some(Event::Inserted(arrived)) => return Ok(Some(arrived)),
-                Some(_) => {}
-                None => return Ok(None),
-            }
-        }
+        sql::next_insert(|| self.next_event())
     }
 
     /// The next query the client ran, answered, or `None` when it closed.
@@ -212,11 +210,7 @@ impl Session {
         if let Some(answer) = self.answering.as_mut().and_then(|f| f(sql)) {
             return (answer, Event::Executed(sql.to_string()));
         }
-        let verb = sql
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .to_ascii_uppercase();
+        let verb = sql::verb(sql);
         match verb.as_str() {
             "SELECT" => (
                 Answer::Rows {
@@ -278,39 +272,30 @@ impl Session {
 
 /// `INSERT INTO <table> (<column>) VALUES ('<literal>')` taken apart:
 /// the table, the column and the literal with its quotes undoubled.
-/// Identifiers may be quoted; anything else is `None`.
+/// Identifiers may be quoted; anything else is `None`. The statement's
+/// shape is the capability's (`transport::sql`, ADR-0044); the quoting is
+/// this dialect's.
 #[must_use]
-pub fn parse_insert(sql: &str) -> Option<(String, String, String)> {
-    let rest = sql.trim().trim_end_matches(';');
-    let rest = strip_word(rest, "INSERT")?;
-    let rest = strip_word(rest, "INTO")?;
-    let (table, rest) = identifier(rest)?;
-    let rest = rest.trim_start().strip_prefix('(')?;
-    let (column, rest) = identifier(rest)?;
-    let rest = rest.trim_start().strip_prefix(')')?;
-    let rest = strip_word(rest, "VALUES")?;
-    let rest = rest.trim_start().strip_prefix('(')?.trim_start();
-    let rest = rest.strip_prefix('\'')?;
+pub fn parse_insert(statement: &str) -> Option<(String, String, String)> {
+    sql::parse_insert(statement, identifier, literal)
+}
+
+/// One `'…'` literal with its quotes undoubled, and what follows it.
+fn literal(rest: &str) -> Option<(String, &str)> {
+    let quoted = rest.strip_prefix('\'')?;
     let mut value = String::new();
-    let mut chars = rest.chars().peekable();
-    loop {
-        match chars.next()? {
-            '\'' if chars.peek() == Some(&'\'') => {
+    let mut chars = quoted.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '\'' if chars.peek().is_some_and(|(_, next)| *next == '\'') => {
                 chars.next();
                 value.push('\'');
             }
-            '\'' => break,
+            '\'' => return Some((value, &quoted[at + 1..])),
             other => value.push(other),
         }
     }
-    let tail: String = chars.collect();
-    (tail.trim() == ")").then_some((table, column, value))
-}
-
-fn strip_word<'a>(rest: &'a str, word: &str) -> Option<&'a str> {
-    let rest = rest.trim_start();
-    let head = rest.get(..word.len())?;
-    head.eq_ignore_ascii_case(word).then(|| &rest[word.len()..])
+    None
 }
 
 /// One identifier, bare or double-quoted, and what follows it.
