@@ -11,6 +11,8 @@
 
 use std::io::Read;
 
+use std::ops::{Deref, DerefMut};
+use transport::cursor::Cursor as Shared;
 use transport::error::{Result, classify, protocol_error};
 
 /// Version 3.0, as the startup message writes it.
@@ -110,48 +112,29 @@ pub fn int32(count: usize) -> i32 {
     i32::try_from(count).unwrap_or(i32::MAX)
 }
 
-/// Reads a body's fields in order.
-pub struct Cursor<'a> {
-    bytes: &'a [u8],
-    at: usize,
+/// Reads a body's fields in order: the transport's cursor, with the
+/// protocol's fields named on it.
+pub struct Cursor<'a>(Shared<'a>);
+
+impl<'a> Deref for Cursor<'a> {
+    type Target = Shared<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Cursor<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 impl<'a> Cursor<'a> {
     /// A cursor at the start of `bytes`.
     #[must_use]
     pub const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
-    }
-
-    /// The next `count` bytes.
-    ///
-    /// # Errors
-    /// Fewer than `count` bytes remain.
-    pub fn take(&mut self, count: usize) -> Result<&'a [u8]> {
-        let end = self
-            .at
-            .checked_add(count)
-            .filter(|end| *end <= self.bytes.len())
-            .ok_or_else(|| protocol_error("a field that runs past the message"))?;
-        let slice = &self.bytes[self.at..end];
-        self.at = end;
-        Ok(slice)
-    }
-
-    /// Past the next `count` bytes.
-    ///
-    /// # Errors
-    /// Fewer than `count` bytes remain.
-    pub fn skip(&mut self, count: usize) -> Result<()> {
-        self.take(count).map(|_| ())
-    }
-
-    /// The next byte.
-    ///
-    /// # Errors
-    /// Nothing remains.
-    pub fn byte(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
+        Self(Shared::new(bytes))
     }
 
     /// The next i16, negative read as zero.
@@ -159,8 +142,7 @@ impl<'a> Cursor<'a> {
     /// # Errors
     /// Fewer than two bytes remain.
     pub fn int16(&mut self) -> Result<usize> {
-        let b = self.take(2)?;
-        Ok(usize::try_from(i16::from_be_bytes([b[0], b[1]])).unwrap_or(0))
+        Ok(usize::try_from(i16::from_be_bytes(self.array()?)).unwrap_or(0))
     }
 
     /// The next i32.
@@ -168,8 +150,7 @@ impl<'a> Cursor<'a> {
     /// # Errors
     /// Fewer than four bytes remain.
     pub fn int32(&mut self) -> Result<i32> {
-        let b = self.take(4)?;
-        Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+        Ok(i32::from_be_bytes(self.array()?))
     }
 
     /// The next NUL-terminated string, lossily UTF-8.
@@ -177,7 +158,8 @@ impl<'a> Cursor<'a> {
     /// # Errors
     /// No NUL before the end.
     pub fn cstring(&mut self) -> Result<String> {
-        let end = self.bytes[self.at..]
+        let end = self
+            .remaining()
             .iter()
             .position(|b| *b == 0)
             .ok_or_else(|| protocol_error("a string that never ends"))?;
