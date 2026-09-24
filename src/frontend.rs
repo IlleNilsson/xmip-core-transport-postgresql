@@ -5,9 +5,13 @@
 
 use std::io::Read;
 
+use codec::cursor::Cursor;
+use codec::writer::ByteWriter;
 use transport::error::{Result, protocol_error};
 
-use crate::wire::{Cursor, PROTOCOL_3_0, SSL_REQUEST, cstring, frame, read_body, read_typed};
+use crate::wire::{
+    PROTOCOL_3_0, Postgres, PostgresWrite, SSL_REQUEST, frame, read_body, read_typed,
+};
 
 /// What a client sends.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,24 +29,23 @@ pub fn encode_frontend(message: &Frontend) -> Vec<u8> {
     let mut body = Vec::new();
     let kind = match message {
         Frontend::SslRequest => {
-            body.extend_from_slice(&SSL_REQUEST.to_be_bytes());
+            body.i32_be(SSL_REQUEST);
             None
         }
         Frontend::Startup { user, database } => {
-            body.extend_from_slice(&PROTOCOL_3_0.to_be_bytes());
+            body.i32_be(PROTOCOL_3_0);
             for (name, value) in [("user", user), ("database", database)] {
-                cstring(&mut body, name);
-                cstring(&mut body, value);
+                body.cstring(name).cstring(value);
             }
             body.push(0);
             None
         }
         Frontend::Password(password) => {
-            cstring(&mut body, password);
+            body.cstring(password);
             Some(b'p')
         }
         Frontend::Query(sql) => {
-            cstring(&mut body, sql);
+            body.cstring(sql);
             Some(b'Q')
         }
         Frontend::Terminate => Some(b'X'),
@@ -60,7 +63,7 @@ pub fn read_startup(reader: &mut impl Read) -> Result<Option<Frontend>> {
         return Ok(None);
     };
     let mut cursor = Cursor::new(&body);
-    let version = cursor.int32()?;
+    let version = cursor.i32_be()?;
     if version == SSL_REQUEST {
         return Ok(Some(Frontend::SslRequest));
     }

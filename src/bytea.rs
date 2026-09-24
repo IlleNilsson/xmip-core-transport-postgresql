@@ -10,20 +10,19 @@
 //! run in hex is read as bytes; that is `PostgreSQL`'s own ambiguity, and
 //! the same one.
 
-use transport::hex::{hex, unhex};
 pub use transport::sql::is_text;
 
 /// `bytes` in the bytea hex form: `\x` then two lower-case digits a byte.
 #[must_use]
 pub fn hex_literal(bytes: &[u8]) -> String {
-    format!("\\x{}", hex(bytes))
+    format!("\\x{}", codec::hex::encode(bytes))
 }
 
 /// The bytes a value in the bytea hex form names, or `None` when `text` is
 /// not in that form.
 #[must_use]
 pub fn from_hex_literal(text: &str) -> Option<Vec<u8>> {
-    unhex(text.strip_prefix("\\x")?).ok()
+    codec::hex::decode(text.strip_prefix("\\x")?).ok()
 }
 
 /// A column value as the bytes it carries: decoded when in the hex form,

@@ -6,9 +6,11 @@
 
 use std::io::Read;
 
+use codec::cursor::Cursor;
+use codec::writer::ByteWriter;
 use transport::error::Result;
 
-use crate::wire::{Cursor, cstring, frame, int16, int32, read_typed};
+use crate::wire::{Postgres, PostgresWrite, frame, read_typed};
 
 /// What a server sends.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,17 +49,15 @@ pub fn encode_backend(message: &Backend) -> Vec<u8> {
     let mut body = Vec::new();
     let kind = match message {
         Backend::Authentication(method) => {
-            body.extend_from_slice(&method.to_be_bytes());
+            body.i32_be(*method);
             b'R'
         }
         Backend::ParameterStatus { name, value } => {
-            cstring(&mut body, name);
-            cstring(&mut body, value);
+            body.cstring(name).cstring(value);
             b'S'
         }
         Backend::BackendKeyData { process, secret } => {
-            body.extend_from_slice(&process.to_be_bytes());
-            body.extend_from_slice(&secret.to_be_bytes());
+            body.i32_be(*process).i32_be(*secret);
             b'K'
         }
         Backend::ReadyForQuery(status) => {
@@ -65,33 +65,30 @@ pub fn encode_backend(message: &Backend) -> Vec<u8> {
             b'Z'
         }
         Backend::RowDescription(columns) => {
-            body.extend_from_slice(&int16(columns.len()).to_be_bytes());
+            body.count(columns.len());
             for column in columns {
-                cstring(&mut body, column);
-                body.extend_from_slice(&0i32.to_be_bytes()); // table
-                body.extend_from_slice(&0i16.to_be_bytes()); // attribute
-                body.extend_from_slice(&25i32.to_be_bytes()); // text
-                body.extend_from_slice(&(-1i16).to_be_bytes()); // varlena
-                body.extend_from_slice(&(-1i32).to_be_bytes()); // no modifier
-                body.extend_from_slice(&0i16.to_be_bytes()); // text format
+                body.cstring(column)
+                    .i32_be(0) // table
+                    .i16_be(0) // attribute
+                    .i32_be(25) // text
+                    .i16_be(-1) // varlena
+                    .i32_be(-1) // no modifier
+                    .i16_be(0); // text format
             }
             b'T'
         }
         Backend::DataRow(values) => {
-            body.extend_from_slice(&int16(values.len()).to_be_bytes());
+            body.count(values.len());
             for value in values {
                 match value {
-                    Some(text) => {
-                        body.extend_from_slice(&int32(text.len()).to_be_bytes());
-                        body.extend_from_slice(text.as_bytes());
-                    }
-                    None => body.extend_from_slice(&(-1i32).to_be_bytes()),
-                }
+                    Some(text) => body.length(text.len()).bytes(text.as_bytes()),
+                    None => body.i32_be(-1),
+                };
             }
             b'D'
         }
         Backend::CommandComplete(tag) => {
-            cstring(&mut body, tag);
+            body.cstring(tag);
             b'C'
         }
         Backend::EmptyQueryResponse => b'I',
@@ -107,7 +104,7 @@ pub fn encode_backend(message: &Backend) -> Vec<u8> {
                 (b'M', message),
             ] {
                 body.push(field);
-                cstring(&mut body, value);
+                body.cstring(value);
             }
             body.push(0);
             b'E'
@@ -127,18 +124,18 @@ pub fn read_backend(reader: &mut impl Read) -> Result<Option<Backend>> {
     };
     let mut cursor = Cursor::new(&body);
     Ok(Some(match kind {
-        b'R' => Backend::Authentication(cursor.int32()?),
+        b'R' => Backend::Authentication(cursor.i32_be()?),
         b'S' => Backend::ParameterStatus {
             name: cursor.cstring()?,
             value: cursor.cstring()?,
         },
         b'K' => Backend::BackendKeyData {
-            process: cursor.int32()?,
-            secret: cursor.int32()?,
+            process: cursor.i32_be()?,
+            secret: cursor.i32_be()?,
         },
         b'Z' => Backend::ReadyForQuery(cursor.byte()?),
         b'T' => {
-            let count = cursor.int16()?;
+            let count = cursor.count()?;
             let mut columns = Vec::with_capacity(count);
             for _ in 0..count {
                 columns.push(cursor.cstring()?);
@@ -147,10 +144,10 @@ pub fn read_backend(reader: &mut impl Read) -> Result<Option<Backend>> {
             Backend::RowDescription(columns)
         }
         b'D' => {
-            let count = cursor.int16()?;
+            let count = cursor.count()?;
             let mut values = Vec::with_capacity(count);
             for _ in 0..count {
-                let length = cursor.int32()?;
+                let length = cursor.i32_be()?;
                 values.push(if length < 0 {
                     None
                 } else {

@@ -4,15 +4,17 @@
 //! version number opens it instead.
 //!
 //! What a client sends is in `frontend.rs` and what a server sends is in
-//! `backend.rs`; this file is what both are made of, and the constants the
+//! `backend.rs`; this file is what both are made of — the framing, and the
+//! protocol's own fields as [`Postgres`] on codec's byte cursor and
+//! [`PostgresWrite`] beside its writer — and the constants the
 //! two logins this crate speaks are named by. MD5 and SCRAM are not
 //! implemented; a server that asks for either is answered with an error
 //! that says so.
 
 use std::io::Read;
 
-use std::ops::{Deref, DerefMut};
-use transport::cursor::Cursor as Shared;
+use codec::cursor::Cursor;
+use codec::writer::ByteWriter;
 use transport::error::{Result, classify, protocol_error};
 
 /// Version 3.0, as the startup message writes it.
@@ -36,10 +38,9 @@ pub const AUTH_SASL: i32 = 10;
 pub fn frame(kind: Option<u8>, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len() + 5);
     if let Some(kind) = kind {
-        out.push(kind);
+        out.byte(kind);
     }
-    out.extend_from_slice(&int32(body.len() + 4).to_be_bytes());
-    out.extend_from_slice(body);
+    out.length(body.len() + 4).bytes(body);
     out
 }
 
@@ -94,78 +95,55 @@ pub fn read_body(reader: &mut impl Read, kind: Option<u8>) -> Result<Option<Vec<
     Ok(Some(body))
 }
 
-/// `text` followed by the NUL that ends a wire string.
-pub fn cstring(out: &mut Vec<u8>, text: &str) {
-    out.extend_from_slice(text.as_bytes());
-    out.push(0);
-}
-
-/// `count` as the wire's i16, saturating.
-#[must_use]
-pub fn int16(count: usize) -> i16 {
-    i16::try_from(count).unwrap_or(i16::MAX)
-}
-
-/// `count` as the wire's i32, saturating.
-#[must_use]
-pub fn int32(count: usize) -> i32 {
-    i32::try_from(count).unwrap_or(i32::MAX)
-}
-
-/// Reads a body's fields in order: the transport's cursor, with the
-/// protocol's fields named on it.
-pub struct Cursor<'a>(Shared<'a>);
-
-impl<'a> Deref for Cursor<'a> {
-    type Target = Shared<'a>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for Cursor<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl<'a> Cursor<'a> {
-    /// A cursor at the start of `bytes`.
-    #[must_use]
-    pub const fn new(bytes: &'a [u8]) -> Self {
-        Self(Shared::new(bytes))
-    }
-
-    /// The next i16, negative read as zero.
+/// The protocol's own fields, read off codec's cursor. Integers are codec's,
+/// big-endian (`i32_be`).
+pub trait Postgres {
+    /// The next i16 count, negative read as zero.
     ///
     /// # Errors
     /// Fewer than two bytes remain.
-    pub fn int16(&mut self) -> Result<usize> {
-        Ok(usize::try_from(i16::from_be_bytes(self.array()?)).unwrap_or(0))
-    }
-
-    /// The next i32.
-    ///
-    /// # Errors
-    /// Fewer than four bytes remain.
-    pub fn int32(&mut self) -> Result<i32> {
-        Ok(i32::from_be_bytes(self.array()?))
-    }
+    fn count(&mut self) -> Result<usize>;
 
     /// The next NUL-terminated string, lossily UTF-8.
     ///
     /// # Errors
     /// No NUL before the end.
-    pub fn cstring(&mut self) -> Result<String> {
-        let end = self
-            .remaining()
-            .iter()
-            .position(|b| *b == 0)
-            .ok_or_else(|| protocol_error("a string that never ends"))?;
-        let text = String::from_utf8_lossy(self.take(end)?).into_owned();
-        self.skip(1)?;
-        Ok(text)
+    fn cstring(&mut self) -> Result<String>;
+}
+
+impl Postgres for Cursor<'_> {
+    fn count(&mut self) -> Result<usize> {
+        Ok(usize::try_from(self.i16_be()?).unwrap_or(0))
+    }
+
+    fn cstring(&mut self) -> Result<String> {
+        Ok(String::from_utf8_lossy(self.take_until(0)?).into_owned())
+    }
+}
+
+/// The protocol's own fields, written beside codec's writer.
+pub trait PostgresWrite {
+    /// `text` followed by the NUL that ends a wire string.
+    fn cstring(&mut self, text: &str) -> &mut Self;
+
+    /// `count` as the wire's i16, saturating.
+    fn count(&mut self, count: usize) -> &mut Self;
+
+    /// `length` as the wire's i32, saturating.
+    fn length(&mut self, length: usize) -> &mut Self;
+}
+
+impl PostgresWrite for Vec<u8> {
+    fn cstring(&mut self, text: &str) -> &mut Self {
+        self.bytes(text.as_bytes()).byte(0)
+    }
+
+    fn count(&mut self, count: usize) -> &mut Self {
+        self.i16_be(i16::try_from(count).unwrap_or(i16::MAX))
+    }
+
+    fn length(&mut self, length: usize) -> &mut Self {
+        self.i32_be(i32::try_from(length).unwrap_or(i32::MAX))
     }
 }
 
@@ -190,16 +168,14 @@ mod tests {
         assert!(read_typed(&mut &b""[..]).expect("closed").is_none());
 
         let mut body = Vec::new();
-        cstring(&mut body, "id");
-        body.extend_from_slice(&int16(3).to_be_bytes());
-        body.extend_from_slice(&int32(70_000).to_be_bytes());
-        body.push(b'Z');
+        body.cstring("id").count(3).length(70_000).byte(b'Z');
         let mut cursor = Cursor::new(&body);
         assert_eq!(cursor.cstring().expect("name"), "id");
-        assert_eq!(cursor.int16().expect("i16"), 3);
-        assert_eq!(cursor.int32().expect("i32"), 70_000);
+        assert_eq!(cursor.count().expect("i16"), 3);
+        assert_eq!(cursor.i32_be().expect("i32"), 70_000);
         assert_eq!(cursor.byte().expect("byte"), b'Z');
-        assert!(cursor.byte().is_err(), "past the end");
+        let error = cursor.byte().expect_err("past the end");
+        assert!(error.message.contains("runs past"), "{}", error.message);
     }
 
     #[test]

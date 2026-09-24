@@ -6,6 +6,7 @@ use std::io::{BufReader, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+use codec::sql::Delimiter;
 use transport::error::{Result, TransportError, classify, protocol_error};
 use transport::socket;
 
@@ -164,13 +165,13 @@ pub fn sql_error(code: &str, message: &str) -> TransportError {
 /// are literal, as `standard_conforming_strings` has had them since 9.1.
 #[must_use]
 pub fn quote_literal(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
+    Delimiter::STRING.quote(text)
 }
 
 /// `name` as an identifier: quoted, every quote doubled, case kept.
 #[must_use]
 pub fn quote_identifier(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+    Delimiter::IDENTIFIER.quote(name)
 }
 
 #[cfg(test)]

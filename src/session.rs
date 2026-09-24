@@ -11,6 +11,7 @@ use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
+use codec::sql::Delimiter;
 use transport::Arrived;
 use transport::error::{Result, TransportError, classify, protocol_error};
 use transport::socket;
@@ -282,28 +283,15 @@ pub fn parse_insert(statement: &str) -> Option<(String, String, String)> {
 
 /// One `'…'` literal with its quotes undoubled, and what follows it.
 fn literal(rest: &str) -> Option<(String, &str)> {
-    let quoted = rest.strip_prefix('\'')?;
-    let mut value = String::new();
-    let mut chars = quoted.char_indices().peekable();
-    while let Some((at, c)) = chars.next() {
-        match c {
-            '\'' if chars.peek().is_some_and(|(_, next)| *next == '\'') => {
-                chars.next();
-                value.push('\'');
-            }
-            '\'' => return Some((value, &quoted[at + 1..])),
-            other => value.push(other),
-        }
-    }
-    None
+    Delimiter::STRING.unquote_prefix(rest).ok()
 }
 
-/// One identifier, bare or double-quoted, and what follows it.
+/// One identifier, bare or double-quoted with `""` for a quote, and what
+/// follows it.
 fn identifier(rest: &str) -> Option<(String, &str)> {
     let rest = rest.trim_start();
-    if let Some(quoted) = rest.strip_prefix('"') {
-        let end = quoted.find('"')?;
-        return Some((quoted[..end].to_string(), &quoted[end + 1..]));
+    if rest.starts_with('"') {
+        return Delimiter::IDENTIFIER.unquote_prefix(rest).ok();
     }
     let end = rest
         .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
@@ -324,6 +312,11 @@ mod tests {
         assert_eq!(
             parse_insert("insert into \"In box\" ( \"Payload\" ) values ( '' )"),
             Some(("In box".into(), "Payload".into(), String::new()))
+        );
+        assert_eq!(
+            parse_insert("INSERT INTO \"in\"\"box\" (\"a\") VALUES ('x')"),
+            Some(("in\"box".into(), "a".into(), "x".into())),
+            "a doubled quote is one, as quote_identifier writes it"
         );
         assert_eq!(
             parse_insert("INSERT INTO public.inbox (payload) VALUES ('a\nb')"),
