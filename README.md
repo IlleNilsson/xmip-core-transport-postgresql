@@ -5,6 +5,10 @@ flow — a Receive Location runs a query and each row is a Stream, a Send
 Location inserts a Stream as a row; trust and cleartext login. A technology of
 [xmip-core-transport](https://github.com/IlleNilsson/xmip-core-transport).
 
+The double-quoted identifiers and string literals it writes and its far end reads are
+`xmip-core-library-codec`'s `sql` module, the one SQL quoting in the estate;
+which delimiter is this dialect's own.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it
