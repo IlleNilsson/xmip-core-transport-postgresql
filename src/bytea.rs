@@ -10,8 +10,6 @@
 //! run in hex is read as bytes; that is `PostgreSQL`'s own ambiguity, and
 //! the same one.
 
-pub use transport::sql::is_text;
-
 /// `bytes` in the bytea hex form: `\x` then two lower-case digits a byte.
 #[must_use]
 pub fn hex_literal(bytes: &[u8]) -> String {
