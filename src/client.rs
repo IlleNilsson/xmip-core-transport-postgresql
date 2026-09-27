@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use codec::sql::Delimiter;
 use transport::error::{Result, TransportError, classify, protocol_error};
+use transport::pool::{Pooled, alive};
 use transport::socket;
 
 use crate::backend::{Backend, read_backend};
@@ -24,6 +25,8 @@ pub struct QueryResult {
     pub tag: String,
 }
 
+/// One logged-in connection, kept between statements while the server
+/// keeps it open.
 pub struct Client {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
@@ -146,6 +149,15 @@ impl Client {
         self.writer
             .flush()
             .map_err(|e| classify("flushing a message", &e))
+    }
+}
+
+impl Pooled for Client {
+    /// While the server has not closed the connection. Each statement runs
+    /// in the simple query flow and ends at `ReadyForQuery`, so nothing of
+    /// one is left for the next.
+    fn usable(&mut self) -> bool {
+        alive(&self.writer)
     }
 }
 

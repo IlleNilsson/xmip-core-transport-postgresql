@@ -25,6 +25,8 @@ value that is not its declared form is refused, never repaired. The two
 settings and the rule are `xmip-core-transport`'s `sql` module, shared by every
 SQL transport.
 
+A Send Location inserts on a connection logged in once per server and database and kept (`transport::Pool`). Until 2026-09-27 every insert logged in and terminated.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it
