@@ -16,14 +16,14 @@ use std::io::Read;
 use codec::cursor::Cursor;
 use codec::unicode::Form;
 use codec::writer::ByteWriter;
+use net::MAX_BODY;
+use transport::ceiling;
 use transport::error::{Result, classify, protocol_error};
 
 /// Version 3.0, as the startup message writes it.
 pub const PROTOCOL_3_0: i32 = 196_608;
 /// The request for TLS a client may open with; answered `N` here.
 pub const SSL_REQUEST: i32 = 80_877_103;
-/// The most one message may be.
-pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
 /// Authentication is done.
 pub const AUTH_OK: i32 = 0;
@@ -48,7 +48,7 @@ pub fn frame(kind: Option<u8>, body: &[u8]) -> Vec<u8> {
 /// A typed message: its type byte and body, or `None` when the peer closed.
 ///
 /// # Errors
-/// A read that failed, a length under four or over [`MAX_MESSAGE`].
+/// A read that failed, a length under four or over `net::MAX_BODY`.
 pub fn read_typed(reader: &mut impl Read) -> Result<Option<(u8, Vec<u8>)>> {
     let mut kind = [0u8];
     let read = reader
@@ -64,7 +64,7 @@ pub fn read_typed(reader: &mut impl Read) -> Result<Option<(u8, Vec<u8>)>> {
 /// `None` this is the startup and a closed connection is `None`.
 ///
 /// # Errors
-/// A read that failed, a length under four or over [`MAX_MESSAGE`].
+/// A read that failed, a length under four or over `net::MAX_BODY`.
 pub fn read_body(reader: &mut impl Read, kind: Option<u8>) -> Result<Option<Vec<u8>>> {
     let mut length = [0u8; 4];
     if kind.is_none() {
@@ -86,9 +86,7 @@ pub fn read_body(reader: &mut impl Read, kind: Option<u8>) -> Result<Option<Vec<
         .ok()
         .and_then(|l| l.checked_sub(4))
         .ok_or_else(|| protocol_error("a message length under four"))?;
-    if length > MAX_MESSAGE {
-        return Err(protocol_error("a message over what Xmip will read"));
-    }
+    ceiling::within(length, MAX_BODY, "Xmip reads in one message")?;
     let mut body = vec![0u8; length];
     reader
         .read_exact(&mut body)

@@ -17,7 +17,7 @@ use codec::sql::Delimiter;
 use transport::Arrived;
 use transport::error::{Result, TransportError, classify, protocol_error};
 use transport::socket;
-use transport::sql::{self, Answering, Column, Inserted, Rows};
+use transport::sql::{self, Answering, Column, Dialect, Inserted, Rows};
 
 use crate::backend::{Backend, encode_backend};
 use crate::frontend::{Frontend, read_frontend, read_startup};
@@ -101,7 +101,7 @@ impl Session {
             let Some(Frontend::Password(given)) = read_frontend(&mut session.reader)? else {
                 return Err(protocol_error("the client did not answer with a password"));
             };
-            if given != expected {
+            if !codec::constant_time::equal(given.as_bytes(), expected.as_bytes()) {
                 let message = format!(
                     "password authentication failed for user \"{}\"",
                     session.user
@@ -292,6 +292,17 @@ impl Session {
     }
 }
 
+/// `PostgreSQL` as the capability writes and reads it: a target opens with
+/// `postgresql://` or `postgres://`, names a database, and an identifier
+/// is double-quoted with `""` for a quote, its case kept, or bare with
+/// `_ .` in it.
+pub const DIALECT: Dialect = Dialect {
+    schemes: &["postgresql", "postgres"],
+    catalog: "database",
+    identifier: Delimiter::IDENTIFIER,
+    bare: &['_', '.'],
+};
+
 /// `INSERT INTO <table> (<column>) VALUES ('<literal>')` taken apart:
 /// the table, the column and the literal with its quotes undoubled.
 /// Identifiers may be quoted; anything else is `None`. The statement's
@@ -299,25 +310,12 @@ impl Session {
 /// this dialect's.
 #[must_use]
 pub fn parse_insert(statement: &str) -> Option<(String, String, String)> {
-    sql::parse_insert(statement, identifier, literal)
+    DIALECT.parse_insert(statement, literal)
 }
 
 /// One `'…'` literal with its quotes undoubled, and what follows it.
 fn literal(rest: &str) -> Option<(String, &str)> {
     Delimiter::STRING.unquote_prefix(rest).ok()
-}
-
-/// One identifier, bare or double-quoted with `""` for a quote, and what
-/// follows it.
-fn identifier(rest: &str) -> Option<(String, &str)> {
-    let rest = rest.trim_start();
-    if rest.starts_with('"') {
-        return Delimiter::IDENTIFIER.unquote_prefix(rest).ok();
-    }
-    let end = rest
-        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
-        .unwrap_or(rest.len());
-    (end > 0).then(|| (rest[..end].to_string(), &rest[end..]))
 }
 
 #[cfg(test)]
