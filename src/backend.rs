@@ -7,6 +7,7 @@
 use std::io::Read;
 
 use codec::cursor::Cursor;
+use codec::unicode::Form;
 use codec::writer::ByteWriter;
 use transport::error::Result;
 
@@ -152,7 +153,7 @@ pub fn read_backend(reader: &mut impl Read) -> Result<Option<Backend>> {
                     None
                 } else {
                     let bytes = cursor.take(usize::try_from(length).unwrap_or(0))?;
-                    Some(String::from_utf8_lossy(bytes).into_owned())
+                    Some(Form::Utf8.decode(bytes)?)
                 });
             }
             Backend::DataRow(values)

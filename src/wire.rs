@@ -14,6 +14,7 @@
 use std::io::Read;
 
 use codec::cursor::Cursor;
+use codec::unicode::Form;
 use codec::writer::ByteWriter;
 use transport::error::{Result, classify, protocol_error};
 
@@ -104,10 +105,10 @@ pub trait Postgres {
     /// Fewer than two bytes remain.
     fn count(&mut self) -> Result<usize>;
 
-    /// The next NUL-terminated string, lossily UTF-8.
+    /// The next NUL-terminated string, strictly UTF-8.
     ///
     /// # Errors
-    /// No NUL before the end.
+    /// No NUL before the end, or bytes that are not UTF-8.
     fn cstring(&mut self) -> Result<String>;
 }
 
@@ -117,7 +118,7 @@ impl Postgres for Cursor<'_> {
     }
 
     fn cstring(&mut self) -> Result<String> {
-        Ok(String::from_utf8_lossy(self.take_until(0)?).into_owned())
+        Ok(Form::Utf8.decode(self.take_until(0)?)?)
     }
 }
 
