@@ -9,9 +9,14 @@
 //! inserts, an integrator polls. A Receive Location runs its query — `SELECT
 //! id, payload FROM inbox ORDER BY id` unless told otherwise — and hands
 //! each row up; a Send Location inserts the Stream as one column of one
-//! row — as text when the Stream is UTF-8 without a NUL, in the bytea hex
-//! form otherwise, and a value in that form is the bytes again on the way
-//! back (`bytea.rs`). What is spoken is the frontend/backend protocol, version 3.0, in
+//! row. What the column holds is the Location's to declare, never the
+//! bytes' (ADR-0038): `column = "binary"`, the default, inserts every
+//! Stream in the bytea hex form and reads a value back from it
+//! (`bytea.rs`); `column = "text"` decodes the Stream strictly in its
+//! `encoding` — `utf-8` unless another Unicode form is named — inserts it
+//! as a string literal, and encodes a value read back to that form. A
+//! Stream that is not its declared form is refused, never repaired. What
+//! is spoken is the frontend/backend protocol, version 3.0, in
 //! its simple query flow, on port 5432: startup, trust or a cleartext
 //! password, `Query`, rows as text, `Terminate`. MD5 and SCRAM are not
 //! implemented and a server that asks for them is told so; TLS is the
@@ -48,7 +53,9 @@ use transport::error::{Result, TransportError, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Directions, Transport};
+use transport::sql::{COLUMN, Column, ENCODING};
+use transport::{Arrived, Configured, Directions, Transport};
+use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
 /// What a Receive Location runs unless told otherwise.
 pub const DEFAULT_QUERY: &str = "SELECT id, payload FROM inbox ORDER BY id";
@@ -66,6 +73,7 @@ pub struct PostgresTransport {
     database: String,
     password: Option<String>,
     query: String,
+    column: Column,
     timeout: Option<Duration>,
 }
 
@@ -83,6 +91,7 @@ impl PostgresTransport {
             database: database.into(),
             password: None,
             query: DEFAULT_QUERY.to_string(),
+            column: Column::Binary,
             timeout: None,
         }
     }
@@ -99,6 +108,13 @@ impl PostgresTransport {
     #[must_use]
     pub fn querying(mut self, query: impl Into<String>) -> Self {
         self.query = query.into();
+        self
+    }
+
+    /// What the payload column holds: bytes unless declared otherwise.
+    #[must_use]
+    pub const fn holding(mut self, column: Column) -> Self {
+        self.column = column;
         self
     }
 
@@ -142,6 +158,7 @@ impl PostgresTransport {
     /// Where the connection could not be accepted or the login failed.
     pub fn accept_one(&self, listener: &TcpListener) -> Result<Session> {
         Session::accept(listener, self.password.as_deref(), self.timeout)
+            .map(|session| session.holding(self.column))
     }
 
     /// Where a target names the server, database, table and column, or
@@ -186,23 +203,26 @@ impl Transport for PostgresTransport {
                 .cloned()
                 .flatten()
                 .unwrap_or_else(|| index.to_string());
-            let value = row.last().cloned().flatten().unwrap_or_default();
+            let value = row.last().cloned().flatten();
+            let bytes = match value {
+                Some(value) => self.column.bytes(&value, bytea::from_hex_literal)?,
+                None => Vec::new(),
+            };
             arrived.push(Arrived::new(
                 format!("postgresql://{}/{}?row={name}", self.server, self.database),
-                bytea::column_bytes(value),
+                bytes,
             ));
         }
         Ok(arrived)
     }
 
-    /// Insert the bytes as one column of one row: text as text, anything
-    /// else in the bytea hex form.
+    /// Insert the bytes as one column of one row: in the bytea hex form,
+    /// or as text where the column is declared to hold it.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
         let (server, database, table, column) = self.resolve(target)?;
-        let literal = match std::str::from_utf8(bytes) {
-            Ok(text) if transport::sql::is_text(bytes) => quote_literal(text),
-            _ => quote_literal(&bytea::hex_literal(bytes)),
-        };
+        let literal = self.column.literal(bytes, quote_literal, |bytes| {
+            quote_literal(&bytea::hex_literal(bytes))
+        })?;
         let mut client = self.connect_to(server, database)?;
         let sql = format!(
             "INSERT INTO {} ({}) VALUES ({})",
@@ -218,6 +238,60 @@ impl Transport for PostgresTransport {
     /// claim one in.
     fn claims(&self) -> Option<&dyn ResourceClaim> {
         Some(&NoNativeClaim)
+    }
+}
+
+impl Configured for PostgresTransport {
+    /// The address is the server's host and port: where a Location connects.
+    const SETTINGS: &'static Settings = &Settings {
+        technology: env!("CARGO_PKG_NAME"),
+        settings: &[
+            Setting {
+                name: "user",
+                kind: Kind::Text,
+                presence: Presence::Required,
+                meaning: "The user a Location logs in as.",
+                applies: Applies::Both,
+            },
+            Setting {
+                name: "database",
+                kind: Kind::Text,
+                presence: Presence::Required,
+                meaning: "The database a Location logs in to and reads or inserts into.",
+                applies: Applies::Both,
+            },
+            Setting {
+                name: "query",
+                kind: Kind::Text,
+                presence: Presence::Default(Fixed::Text(DEFAULT_QUERY)),
+                meaning: "The query a receive runs: the first column names the row, the last \
+                          is the Stream.",
+                applies: Applies::Receive,
+            },
+            COLUMN,
+            ENCODING,
+            Setting {
+                name: "timeout",
+                kind: Kind::Duration,
+                presence: Presence::Optional,
+                meaning: "How long a server that stops mid-message is waited on; unbounded \
+                          when left out.",
+                applies: Applies::Both,
+            },
+        ],
+    };
+
+    /// The password comes through the Location's credentials, never a
+    /// setting.
+    fn configured(address: &str, settings: &Read) -> Result<Self> {
+        let mut transport = Self::new(address, settings.text("user"), settings.text("database"));
+        if let Some(query) = settings.optional_text("query") {
+            transport = transport.querying(query);
+        }
+        if let Some(timeout) = settings.optional_duration("timeout") {
+            transport = transport.timing_out_after(timeout);
+        }
+        Ok(transport.holding(Column::configured(settings)?))
     }
 }
 
@@ -249,8 +323,8 @@ impl Loopback for PostgresTransport {
         Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
     }
 
-    /// INSERT the payload as one column of one row — text as text, anything
-    /// else in the bytea hex form — from a fresh near end logging in to
+    /// INSERT the payload as one column of one row, as the column is
+    /// declared to hold it, from a fresh near end logging in to
     /// `address` as this transport does.
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
         let near = Self {
@@ -264,10 +338,46 @@ impl Loopback for PostgresTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codec::unicode::Form;
     use transport::payload::edge_payloads;
+
+    /// The bytes 0xff 0xfe as a bytea column answers them.
+    const HEX_FFFE: &str = "\\xfffe";
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    #[test]
+    fn postgresql_declares_its_settings_and_reads_through_them() {
+        use xcore::settings::Given;
+        assert_eq!(PostgresTransport::SETTINGS.problems(), Vec::<String>::new());
+        let text = |name: &str, value: &str| (name.to_string(), Given::Text(value.to_string()));
+        let given = [
+            text("user", "xmip"),
+            text("database", "orders"),
+            text("timeout", "2s"),
+        ];
+        let built = PostgresTransport::open("db:5432", Applies::Receive, &given).expect("built");
+        assert_eq!(built.server, "db:5432");
+        assert_eq!(built.user, "xmip");
+        assert_eq!(built.database, "orders");
+        assert_eq!(built.query, DEFAULT_QUERY);
+        assert_eq!(built.password, None);
+        assert_eq!(built.timeout, Some(secs(2)));
+        assert_eq!(built.column, Column::Binary, "bytes unless declared");
+        let texts = [
+            text("user", "xmip"),
+            text("database", "orders"),
+            text("column", "text"),
+            text("encoding", "utf-16le"),
+        ];
+        let built = PostgresTransport::open("db:5432", Applies::Send, &texts).expect("text");
+        assert_eq!(built.column, Column::Text(Form::Utf16Le));
+        let Err(refused) = PostgresTransport::open("db:5432", Applies::Send, &given[1..]) else {
+            panic!("user is required");
+        };
+        assert!(refused.message.contains("\"user\""), "{}", refused.message);
     }
 
     #[test]
@@ -278,6 +388,7 @@ mod tests {
         let receiver = std::thread::spawn(move || {
             PostgresTransport::new(address, "xmip", "orders")
                 .querying("SELECT id, kind, payload FROM inbox ORDER BY id")
+                .holding(Column::Text(Form::Utf8))
                 .timing_out_after(secs(2))
                 .receive()
         });
@@ -357,6 +468,52 @@ mod tests {
         assert!(refused.message.contains("28P01"));
         assert!(far_end.claims().is_some(), "rows are artefacts");
         assert_eq!(far_end.name(), "postgresql");
+    }
+
+    #[test]
+    fn a_binary_column_reads_the_hex_form_and_refuses_what_is_not() {
+        let far_end =
+            PostgresTransport::new("127.0.0.1:0", "xmip", "orders").timing_out_after(secs(2));
+        let (listener, address) = far_end.bind().expect("binding");
+        let receiver = std::thread::spawn(move || {
+            let near = PostgresTransport::new(address, "xmip", "orders").timing_out_after(secs(2));
+            (near.receive(), near.receive())
+        });
+        let rows: [&[Option<&str>]; 1] = [&[Some("1"), Some(HEX_FFFE)]];
+        let mut session = far_end
+            .accept_one(&listener)
+            .expect("first")
+            .with_table(&["id", "payload"], &rows);
+        while session.next_event().expect("event").is_some() {}
+        let text: [&[Option<&str>]; 1] = [&[Some("2"), Some("ISA*00*")]];
+        let mut session = far_end
+            .accept_one(&listener)
+            .expect("second")
+            .with_table(&["id", "payload"], &text);
+        while session.next_event().expect("event").is_some() {}
+        let (bytes, text) = receiver.join().expect("thread");
+        assert_eq!(bytes.expect("the hex form")[0].bytes, [0xff, 0xfe]);
+        let refused = text.expect_err("text in a binary column");
+        assert!(
+            refused.message.contains("column = \"text\""),
+            "{}",
+            refused.message
+        );
+    }
+
+    #[test]
+    fn a_text_column_refuses_a_stream_that_is_not_its_encoding() {
+        let near = PostgresTransport::new("127.0.0.1:1", "xmip", "orders")
+            .holding(Column::Text(Form::Utf8));
+        let refused = near
+            .send("inbox/payload", &[0xff, 0xfe])
+            .expect_err("not UTF-8");
+        assert!(!refused.retryable);
+        assert!(
+            refused.message.contains("utf-8 text"),
+            "{}",
+            refused.message
+        );
     }
 
     #[test]
