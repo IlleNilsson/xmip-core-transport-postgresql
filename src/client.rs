@@ -168,12 +168,6 @@ pub fn quote_literal(text: &str) -> String {
     Delimiter::STRING.quote(text)
 }
 
-/// `name` as an identifier: quoted, every quote doubled, case kept.
-#[must_use]
-pub fn quote_identifier(name: &str) -> String {
-    Delimiter::IDENTIFIER.quote(name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +177,7 @@ mod tests {
         assert_eq!(quote_literal("it's"), "'it''s'");
         assert_eq!(quote_literal("back\\slash"), "'back\\slash'");
         assert_eq!(quote_literal(""), "''");
+        let quote_identifier = |name| crate::session::DIALECT.quote_identifier(name);
         assert_eq!(quote_identifier("in\"box"), "\"in\"\"box\"");
         assert_eq!(quote_identifier("Inbox"), "\"Inbox\"");
     }
