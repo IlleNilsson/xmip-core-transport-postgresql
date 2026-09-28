@@ -17,7 +17,7 @@ use codec::cursor::Cursor;
 use codec::unicode::Form;
 use codec::writer::ByteWriter;
 use net::MAX_BODY;
-use transport::ceiling;
+use net::ceiling;
 use transport::error::{Result, classify, protocol_error};
 
 /// Version 3.0, as the startup message writes it.
