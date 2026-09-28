@@ -27,6 +27,8 @@ SQL transport.
 
 A Send Location inserts on a connection logged in once per server and database and kept (`transport::Pool`). Until 2026-09-27 every insert logged in and terminated.
 
+A Receive Location runs its query on a connection kept the same way: logged in on its first receive and reused by every receive after, replaced where the server closed it. Until 2026-09-28 every receive logged in and terminated.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it
