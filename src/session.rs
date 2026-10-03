@@ -14,7 +14,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
 use codec::sql::Delimiter;
-use transport::Arrived;
+use transport::Taken;
 use transport::error::{Result, TransportError, classify, protocol_error};
 use transport::socket;
 use transport::sql::{self, Answering, Column, Dialect, Inserted, Rows};
@@ -29,13 +29,13 @@ pub enum Event {
     /// The client ran a SELECT; here it is.
     Selected(String),
     /// The client inserted one value; here is the Stream.
-    Inserted(Arrived),
+    Inserted(Taken),
     /// The client ran something else; here it is.
     Executed(String),
 }
 
 impl Inserted for Event {
-    fn inserted(self) -> Option<Arrived> {
+    fn inserted(self) -> Option<Taken> {
         match self {
             Self::Inserted(arrived) => Some(arrived),
             Self::Selected(_) | Self::Executed(_) => None,
@@ -192,7 +192,7 @@ impl Session {
     ///
     /// # Errors
     /// Where the connection broke, or nothing arrived before the timeout.
-    pub fn next_insert(&mut self) -> Result<Option<Arrived>> {
+    pub fn next_insert(&mut self) -> Result<Option<Taken>> {
         sql::next_insert(|| self.next_event())
     }
 
@@ -241,7 +241,7 @@ impl Session {
                     match self.column.bytes(&value, crate::bytea::from_hex_literal) {
                         Ok(bytes) => (
                             Answer::Complete("INSERT 0 1".to_string()),
-                            Event::Inserted(Arrived::new(origin, bytes)),
+                            Event::Inserted(Taken::new(origin, bytes)),
                         ),
                         Err(refused) => (
                             Answer::Error {
@@ -301,6 +301,7 @@ pub const DIALECT: Dialect = Dialect {
     catalog: "database",
     identifier: Delimiter::IDENTIFIER,
     bare: &['_', '.'],
+    marker: "$1",
 };
 
 /// `INSERT INTO <table> (<column>) VALUES ('<literal>')` taken apart:
