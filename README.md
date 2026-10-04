@@ -10,10 +10,10 @@ Location inserts a Stream as a row; trust and cleartext login. A technology of
 The Location's query only reads; what consumes a row is the `accept` statement, run after the row's receive cycle. `accept` (text, receive side, optional) is a statement — `DELETE FROM inbox WHERE id = $1`, an `UPDATE` of a status column — with the row's name, the query's first column as the origin carries it, in place of `$1`, written as a string literal by `quote_literal` (`transport::sql::accept`, the marker `$1` being `PostgreSQL`'s first parameter), so whatever the column holds stays one value. It runs on the connection kept for the server and database:
 
 - **Accepted**: `accept` runs; the row is consumed once its Stream is Xmip's.
-- **Refused**: `accept` runs too: a table has no place for a refused row, the runtime audited the refusal, and from Message creation on the Stream is kept in Xmip (ADR-0013).
+- **Refused**: nothing runs. A refusal is not a consumption: the row is the only copy, so it is left where it lies, and this Location does not receive it again while its body is unchanged; a row whose body changed is a new arrival. The memory is the node process's (`transport::refused`).
 - **Failed**: nothing runs, and the next receive reads the row again.
 
-A row whose first column is NULL has no name to bind, and nothing runs for it. Where `accept` is left out a row's verdict tells the database nothing: every row is read again unless the query keeps it from that, and a query that consumes as it reads — a `DELETE … RETURNING` — consumes before the receive cycle has run: acceptance is then at-most-once. Each statement is one round trip per accepted or refused row, on the kept connection. Each row is a whole value of the result, read whole.
+A row whose first column is NULL has no name to bind, and nothing runs for it. Where `accept` is left out a row's verdict tells the database nothing: every row is read again unless the query keeps it from that, and a query that consumes as it reads — a `DELETE … RETURNING` — consumes before the receive cycle has run: acceptance is then at-most-once. Each statement is one round trip per accepted row, on the kept connection. Each row is a whole value of the result, read whole.
 
 The double-quoted identifiers and string literals it writes and its far end reads are
 `xmip-core-library-codec`'s `sql` module, the one SQL quoting in the estate;
