@@ -12,7 +12,7 @@
 //! one row. What the column holds is the Location's to declare, never the
 //! bytes' (ADR-0038): `column = "binary"`, the default, inserts every
 //! Stream in the bytea hex form and reads a value back from it
-//! (`bytea.rs`); `column = "text"` decodes the Stream strictly in its
+//! (`PostgreSQL`'s, `xmip-core-library-sql`); `column = "text"` decodes the Stream strictly in its
 //! `encoding` — `utf-8` unless another Unicode form is named — inserts it
 //! as a string literal, and encodes a value read back to that form. A
 //! Stream that is not its declared form is refused, never repaired. What
@@ -33,8 +33,8 @@
 //! **A row is consumed by the `accept` statement, after its cycle.** The query
 //! only reads. Where the Location declares `accept` — `DELETE FROM inbox WHERE
 //! id = $1` — it runs once a row's cycle accepted it, the row's name bound in
-//! place of `$1` (`transport::sql::accept`), written as a string literal by
-//! `quote_literal`. A refused row is left where it lies, and not received again
+//! place of `$1` (`transport::sql::accept`), written as `PostgreSQL`'s
+//! string literal. A refused row is left where it lies, and not received again
 //! while its body is unchanged. A row whose cycle failed is left, and the next
 //! receive reads it again; so is a row whose name is NULL, which no statement
 //! can name. Where `accept` is left out a row's verdict tells the database
@@ -49,7 +49,6 @@
 //! configured server and database.
 
 pub mod backend;
-pub mod bytea;
 pub mod client;
 pub mod frontend;
 pub mod session;
@@ -59,19 +58,22 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use client::{Client, QueryResult, quote_literal};
+pub use client::{Client, QueryResult};
 pub use session::{Answer, Event, Session};
+use sql::POSTGRESQL;
 use transport::ArrivalIdentity;
 use transport::claim::{NoNativeClaim, ResourceClaim};
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::sql::{COLUMN, Column, ENCODING, accept};
+use transport::sql::{COLUMN, Column, ENCODING, accept, destination};
 use transport::{Arrived, Configured, Directions, Pool, Taken, Transport};
 
-use session::DIALECT;
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
+
+/// The schemes a send target may open with.
+const SCHEMES: &[&str] = &["postgresql", "postgres"];
 
 /// What a Receive Location runs unless told otherwise.
 pub const DEFAULT_QUERY: &str = "SELECT id, payload FROM inbox ORDER BY id";
@@ -210,6 +212,10 @@ impl Transport for PostgresTransport {
         transport::Arrivals::Ordered("a poll reads again what is not yet told")
     }
 
+    fn waiting(&self) -> transport::Waiting {
+        transport::Waiting::Polled("a query runs and returns its rows at once")
+    }
+
     /// Run the query on the connection kept for the server and database, logged in
     /// on the first receive; each row is a Stream, whole. Its verdict runs the
     /// `accept` statement where one is declared — on `Accepted`, never on `Refused`
@@ -228,10 +234,10 @@ impl Transport for PostgresTransport {
             &self.refused,
             |name| format!("postgresql://{}/{}?row={name}", self.server, self.database),
             Clone::clone,
-            |value| self.column.bytes(&value, bytea::from_hex_literal),
+            |value| self.column.bytes(&value, &POSTGRESQL),
             |name| {
                 let transport = Arc::clone(&shared);
-                DIALECT.accepting(self.accept.as_deref(), name, quote_literal, move |sql| {
+                accept::accepting(&POSTGRESQL, self.accept.as_deref(), name, move |sql| {
                     transport.connections.exchange(
                         &format!("{}/{}", transport.server, transport.database),
                         || transport.connect(),
@@ -247,14 +253,12 @@ impl Transport for PostgresTransport {
     /// connection kept for the server and database, logged in on the first
     /// send to them.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
-        let to = DIALECT.destination(target, &self.server, &self.database)?;
-        let literal = self.column.literal(bytes, quote_literal, |bytes| {
-            quote_literal(&bytea::hex_literal(bytes))
-        })?;
-        let insert = DIALECT.insert(to.table, to.column, &literal);
+        let to = destination(SCHEMES, target, &self.server, &self.database)?;
+        let literal = self.column.literal(bytes, &POSTGRESQL)?;
+        let insert = POSTGRESQL.insert(to.table, to.column, &literal);
         self.connections.exchange(
-            &format!("{}/{}", to.server, to.catalog),
-            || self.connect_to(to.server, to.catalog),
+            &format!("{}/{}", to.server, to.database),
+            || self.connect_to(to.server, to.database),
             |client| client.execute(&insert).map(|_| ()),
         )
     }

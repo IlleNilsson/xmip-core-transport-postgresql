@@ -21,10 +21,12 @@ transport = { package = "xmip-core-transport", git = "https://github.com/IlleNil
 # transport::Configured (ADR-0064, amendment 2026-09-26).
 xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
 # The estate's encoding primitives: the byte cursor and writer the fields
-# are read and written over, hex for the bytea form, and SQL's delimited
-# literals and identifiers, written and read once for every dialect;
-# which delimiter is this one's own.
+# are read and written over.
 codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main" }
+# SQL: the PostgreSQL dialect this server speaks — its literals, the bytea
+# hex form, the INSERT a send writes and a far end takes apart, and a
+# statement's verb.
+sql = { package = "xmip-core-library-sql", git = "https://github.com/IlleNilsson/xmip-core-library-sql", branch = "main" }
 # The most a connection is read for: the ceiling a message's length is
 # held to (`net::MAX_BODY`).
 net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main" }
