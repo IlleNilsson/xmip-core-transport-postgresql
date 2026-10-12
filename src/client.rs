@@ -6,7 +6,6 @@ use std::io::{BufReader, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use codec::sql::Delimiter;
 use transport::error::{Result, TransportError, classify, protocol_error};
 use transport::pool::{Pooled, alive};
 use transport::socket;
@@ -173,26 +172,9 @@ pub fn sql_error(code: &str, message: &str) -> TransportError {
     }
 }
 
-/// `text` as a string literal: quoted, every quote doubled. Backslashes
-/// are literal, as `standard_conforming_strings` has had them since 9.1.
-#[must_use]
-pub fn quote_literal(text: &str) -> String {
-    Delimiter::STRING.quote(text)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn quoting_doubles_the_delimiter_and_nothing_else() {
-        assert_eq!(quote_literal("it's"), "'it''s'");
-        assert_eq!(quote_literal("back\\slash"), "'back\\slash'");
-        assert_eq!(quote_literal(""), "''");
-        let quote_identifier = |name| crate::session::DIALECT.quote_identifier(name);
-        assert_eq!(quote_identifier("in\"box"), "\"in\"\"box\"");
-        assert_eq!(quote_identifier("Inbox"), "\"Inbox\"");
-    }
 
     #[test]
     fn an_error_is_judged_by_its_class() {

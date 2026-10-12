@@ -13,11 +13,11 @@ use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
-use codec::sql::Delimiter;
+use sql::{Literal, POSTGRESQL, Verb};
 use transport::Taken;
 use transport::error::{Result, TransportError, classify, protocol_error};
 use transport::socket;
-use transport::sql::{self, Answering, Column, Dialect, Inserted, Rows};
+use transport::sql::{Answering, Column, Inserted, Rows, next_insert, table};
 
 use crate::backend::{Backend, encode_backend};
 use crate::frontend::{Frontend, read_frontend, read_startup};
@@ -172,7 +172,7 @@ impl Session {
     /// Answer any SELECT with these `columns` and `rows`.
     #[must_use]
     pub fn with_table(mut self, columns: &[&str], rows: &[&[Option<&str>]]) -> Self {
-        (self.columns, self.rows) = sql::table(columns, rows);
+        (self.columns, self.rows) = table(columns, rows);
         self
     }
 
@@ -193,7 +193,7 @@ impl Session {
     /// # Errors
     /// Where the connection broke, or nothing arrived before the timeout.
     pub fn next_insert(&mut self) -> Result<Option<Taken>> {
-        sql::next_insert(|| self.next_event())
+        next_insert(|| self.next_event())
     }
 
     /// The next query the client ran, answered, or `None` when it closed.
@@ -223,22 +223,22 @@ impl Session {
         if let Some(answer) = self.answering.as_mut().and_then(|f| f(sql)) {
             return (answer, Event::Executed(sql.to_string()));
         }
-        let verb = sql::verb(sql);
-        match verb.as_str() {
-            "SELECT" => (
+        let verb = Verb::of_statement(sql);
+        match verb {
+            Some(Verb::Select) => (
                 Answer::Rows {
                     columns: self.columns.clone(),
                     rows: self.rows.clone(),
                 },
                 Event::Selected(sql.to_string()),
             ),
-            "INSERT" => match parse_insert(sql) {
-                Some((table, column, value)) => {
+            Some(Verb::Insert) => match POSTGRESQL.parse_insert_literal(sql) {
+                Some((table, column, Literal::Text(value))) => {
                     let origin = format!(
                         "postgresql://{}/{}/{table}/{column}",
                         self.peer, self.database
                     );
-                    match self.column.bytes(&value, crate::bytea::from_hex_literal) {
+                    match self.column.bytes(&value, &POSTGRESQL) {
                         Ok(bytes) => (
                             Answer::Complete("INSERT 0 1".to_string()),
                             Event::Inserted(Taken::new(origin, bytes)),
@@ -252,7 +252,7 @@ impl Session {
                         ),
                     }
                 }
-                None => (
+                _ => (
                     Answer::Error {
                         code: "42601".to_string(),
                         message: "only INSERT INTO t (c) VALUES ('v') is served here".to_string(),
@@ -260,7 +260,11 @@ impl Session {
                     Event::Executed(sql.to_string()),
                 ),
             },
-            _ => (Answer::Complete(verb), Event::Executed(sql.to_string())),
+            _ => {
+                // The command tag names the verb, as the server's does.
+                let tag = verb.map_or_else(String::new, |verb| verb.name().to_ascii_uppercase());
+                (Answer::Complete(tag), Event::Executed(sql.to_string()))
+            }
         }
     }
 
@@ -289,61 +293,5 @@ impl Session {
         self.writer
             .flush()
             .map_err(|e| classify("flushing a message", &e))
-    }
-}
-
-/// `PostgreSQL` as the capability writes and reads it: a target opens with
-/// `postgresql://` or `postgres://`, names a database, and an identifier
-/// is double-quoted with `""` for a quote, its case kept, or bare with
-/// `_ .` in it.
-pub const DIALECT: Dialect = Dialect {
-    schemes: &["postgresql", "postgres"],
-    catalog: "database",
-    identifier: Delimiter::IDENTIFIER,
-    bare: &['_', '.'],
-    marker: "$1",
-};
-
-/// `INSERT INTO <table> (<column>) VALUES ('<literal>')` taken apart:
-/// the table, the column and the literal with its quotes undoubled.
-/// Identifiers may be quoted; anything else is `None`. The statement's
-/// shape is the capability's (`transport::sql`, ADR-0044); the quoting is
-/// this dialect's.
-#[must_use]
-pub fn parse_insert(statement: &str) -> Option<(String, String, String)> {
-    DIALECT.parse_insert(statement, literal)
-}
-
-/// One `'…'` literal with its quotes undoubled, and what follows it.
-fn literal(rest: &str) -> Option<(String, &str)> {
-    Delimiter::STRING.unquote_prefix(rest).ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_insert_of_one_column_is_taken_apart() {
-        assert_eq!(
-            parse_insert("INSERT INTO inbox (payload) VALUES ('it''s here');"),
-            Some(("inbox".into(), "payload".into(), "it's here".into()))
-        );
-        assert_eq!(
-            parse_insert("insert into \"In box\" ( \"Payload\" ) values ( '' )"),
-            Some(("In box".into(), "Payload".into(), String::new()))
-        );
-        assert_eq!(
-            parse_insert("INSERT INTO \"in\"\"box\" (\"a\") VALUES ('x')"),
-            Some(("in\"box".into(), "a".into(), "x".into())),
-            "a doubled quote is one, as quote_identifier writes it"
-        );
-        assert_eq!(
-            parse_insert("INSERT INTO public.inbox (payload) VALUES ('a\nb')"),
-            Some(("public.inbox".into(), "payload".into(), "a\nb".into()))
-        );
-        assert!(parse_insert("INSERT INTO inbox (a, b) VALUES ('x', 'y')").is_none());
-        assert!(parse_insert("INSERT INTO inbox (a) VALUES ('open").is_none());
-        assert!(parse_insert("UPDATE inbox SET a = 'x'").is_none());
     }
 }
