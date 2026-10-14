@@ -576,7 +576,7 @@ mod tests {
         assert_eq!(first.bytes, b"it's here");
         assert!(first.origin_uri.ends_with("/orders/inbox/payload"));
         let second = session.next_insert().expect("second").expect("one");
-        assert!(second.bytes.is_empty());
+        assert_eq!(second.bytes, [] as [u8; 0]);
         assert!(second.origin_uri.ends_with("/orders/outbox/body"));
         let binary = session.next_insert().expect("third").expect("one");
         assert_eq!(
