@@ -22,7 +22,7 @@
 //! implemented and a server that asks for them is told so; TLS is the
 //! transport capability's, per ADR-0033.
 //!
-//! Rows are artefacts and this transport claims none of them, per ADR-0024:
+//! Rows are artifacts and this transport claims none of them, per ADR-0024:
 //! the atomic claim a database has, `SELECT … FOR UPDATE SKIP LOCKED`, only
 //! holds inside a transaction, and the simple flow here opens and closes
 //! its connection inside one receive, so there is no transaction to hold
@@ -269,7 +269,7 @@ impl Transport for PostgresTransport {
         )
     }
 
-    /// Rows are artefacts, and the simple flow holds no transaction to
+    /// Rows are artifacts, and the simple flow holds no transaction to
     /// claim one in.
     fn claims(&self) -> Option<&dyn ResourceClaim> {
         Some(&NoNativeClaim)
@@ -597,7 +597,7 @@ mod tests {
         let refused = refused.expect_err("wrong password");
         assert!(!refused.retryable);
         assert!(refused.message.contains("28P01"));
-        assert!(far_end.claims().is_some(), "rows are artefacts");
+        assert!(far_end.claims().is_some(), "rows are artifacts");
         assert_eq!(far_end.name(), "postgresql");
     }
 
