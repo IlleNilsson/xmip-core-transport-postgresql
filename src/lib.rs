@@ -86,6 +86,9 @@ const LOOPBACK_TARGET: &str = "probe/payload";
 
 #[derive(Clone)]
 pub struct PostgresTransport {
+    /// The secret its Location names, whose password the login presents,
+    /// read at each login (ADR-0019, amendment 2026-10-29).
+    secret: Option<transport::Secured>,
     server: String,
     user: String,
     database: String,
@@ -112,6 +115,7 @@ impl PostgresTransport {
         database: impl Into<String>,
     ) -> Self {
         Self {
+            secret: None,
             server: server.into(),
             user: user.into(),
             database: database.into(),
@@ -171,11 +175,15 @@ impl PostgresTransport {
     }
 
     fn connect_to(&self, server: &str, database: &str) -> Result<Client> {
+        let password = match &self.secret {
+            Some(secret) => Some(secret.as_kind(xcore::SecretKind::Password, "postgresql")?),
+            None => self.password.clone(),
+        };
         Client::connect(
             server,
             &self.user,
             database,
-            self.password.as_deref(),
+            password.as_deref(),
             self.timeout,
         )
     }
@@ -277,6 +285,12 @@ impl Transport for PostgresTransport {
 }
 
 impl Configured for PostgresTransport {
+    /// The password the Location's secret holds, read at each login.
+    fn secured_by(mut self, secret: transport::Secured) -> Result<Self> {
+        self.secret = Some(secret);
+        Ok(self)
+    }
+
     /// The address is the server's host and port: where a Location connects.
     const SETTINGS: &'static Settings = &Settings {
         technology: env!("CARGO_PKG_NAME"),
@@ -320,7 +334,7 @@ impl Configured for PostgresTransport {
     /// The schemes a Location's address is entered with to choose this technology.
     const SCHEMES: &'static [&'static str] = SCHEMES;
 
-    /// The password comes through the Location's credentials, never a
+    /// The password is the secret the Location names, never a
     /// setting.
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         let mut transport = Self::new(address, settings.text("user"), settings.text("database"));
