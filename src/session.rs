@@ -1,5 +1,5 @@
 //! The server's side of one connection: what a test puts at the far end,
-//! and what the playground drives.
+//! and what the essentials drives.
 //!
 //! Not a database. One session does the login for one client — trust, or
 //! a cleartext password it demands and checks — and answers each query
