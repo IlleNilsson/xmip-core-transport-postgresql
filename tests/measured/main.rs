@@ -10,6 +10,7 @@
 //! - a thousand receives on one connection take a millisecond a query at
 //!   most.
 
+use std::assert_matches;
 use std::time::{Duration, Instant};
 
 use transport::Transport;
@@ -69,7 +70,7 @@ fn a_thousand_receives_take_a_millisecond_a_query_at_most() {
         .with_table(&["id", "payload"], &[&[Some("1"), None]]);
     for _ in 0..RECEIVES {
         let event = session.next_event().expect("query");
-        assert!(matches!(event, Some(Event::Selected(_))), "{event:?}");
+        assert_matches!(event, Some(Event::Selected(_)), "{event:?}");
     }
     receiver.join().expect("thread").expect("receiving");
 }
