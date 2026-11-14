@@ -1,9 +1,17 @@
 # xmip-core-transport-postgresql
 
-PostgreSQL transport: the frontend/backend protocol 3.0 in its simple query
-flow — a Receive Location runs a query and each row is a Stream, a Send
-Location inserts a Stream as a row; trust and cleartext login. A technology of
+PostgreSQL transport: a Receive Location runs a query and each row is a
+Stream, a Send Location inserts a Stream as a row; trust and cleartext login.
+A technology of
 [xmip-core-transport](https://github.com/IlleNilsson/xmip-core-transport).
+
+The transport is every SQL technology's, `transport::sql::SqlTransport`, over
+this crate's `PostgreSql` wire (2026-11-13): its name and schemes, its
+settings, the PostgreSQL dialect, the client, and the far end its loopback
+serves (`accept_one`, `taken`). The protocol — the frontend/backend protocol
+3.0 in its simple query flow, both halves — is
+[xmip-core-library-postgresql](https://github.com/IlleNilsson/xmip-core-library-postgresql)'s,
+which the archive target speaks too; until 2026-11-13 it sat here.
 
 ## Acknowledgement
 
