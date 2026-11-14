@@ -12,35 +12,24 @@
 //! one row. What the column holds is the Location's to declare, never the
 //! bytes' (ADR-0038): `column = "binary"`, the default, inserts every
 //! Stream in the bytea hex form and reads a value back from it
-//! (`PostgreSQL`'s, `xmip-core-library-sql`); `column = "text"` decodes the Stream strictly in its
-//! `encoding` — `utf-8` unless another Unicode form is named — inserts it
-//! as a string literal, and encodes a value read back to that form. A
-//! Stream that is not its declared form is refused, never repaired. What
-//! is spoken is the frontend/backend protocol, version 3.0, in
-//! its simple query flow, on port 5432: startup, trust or a cleartext
-//! password, `Query`, rows as text, `Terminate`. MD5 and SCRAM are not
-//! implemented and a server that asks for them is told so; TLS is the
-//! transport capability's, per ADR-0033.
+//! (`PostgreSQL`'s, `xmip-core-library-sql`); `column = "text"` decodes
+//! the Stream strictly in its `encoding` — `utf-8` unless another Unicode
+//! form is named — inserts it as a string literal, and encodes a value
+//! read back to that form. A Stream that is not its declared form is
+//! refused, never repaired.
 //!
-//! Rows are artifacts and this transport claims none of them, per ADR-0024:
-//! the atomic claim a database has, `SELECT … FOR UPDATE SKIP LOCKED`, only
-//! holds inside a transaction, and the simple flow here opens and closes
-//! its connection inside one receive, so there is no transaction to hold
-//! it across the Stream's lifetime. Until the claim is written, a Receive
-//! Location is one consumer of its query, and the query itself — a status
-//! column, a `DELETE … RETURNING` — is what keeps a row from arriving twice.
+//! **The transport is every SQL technology's**, `transport::sql`'s
+//! `SqlTransport` over this crate's [`PostgreSql`] wire (2026-11-13): the
+//! query and its rows, the `accept` statement after a row's cycle — the
+//! row's name in place of `$1`, written as `PostgreSQL`'s string literal —
+//! the INSERT a send writes, the connections kept per server and database.
 //!
-//! **A row is consumed by the `accept` statement, after its cycle.** The query
-//! only reads. Where the Location declares `accept` — `DELETE FROM inbox WHERE
-//! id = $1` — it runs once a row's cycle accepted it, the row's name bound in
-//! place of `$1` (`transport::sql::accept`), written as `PostgreSQL`'s
-//! string literal. A refused row is left where it lies, and not received again
-//! while its body is unchanged. A row whose cycle failed is left, and the next
-//! receive reads it again; so is a row whose name is NULL, which no statement
-//! can name. Where `accept` is left out a row's verdict tells the database
-//! nothing: every row is read again unless the query keeps it from that, and a
-//! query that consumes as it reads — a `DELETE … RETURNING` — consumes before
-//! the receive cycle has run, so acceptance is at-most-once under such a query.
+//! **The protocol is `xmip-core-library-postgresql`'s**: the
+//! frontend/backend protocol, version 3.0, in its simple query flow, on
+//! port 5432 — startup, trust or a cleartext password, `Query`, rows as
+//! text, `Terminate` — and the far end the tests and the Essentials serve.
+//! MD5 and SCRAM are not implemented and a server that asks for them is
+//! told so; TLS is the transport capability's, per ADR-0033.
 //!
 //! The origin URI carries what the row knew:
 //! `postgresql://server/orders?row=41`. A send target is
@@ -48,358 +37,143 @@
 //! `host:5432/<database>/<table>/<column>`, or `<table>/<column>` on the
 //! configured server and database.
 
-pub mod backend;
-pub mod client;
-pub mod frontend;
-pub mod session;
-pub mod wire;
-
 use std::net::TcpListener;
-use std::sync::Arc;
 use std::time::Duration;
 
-pub use client::{Client, QueryResult};
-pub use session::{Answer, Event, Session};
-use sql::POSTGRESQL;
-use transport::ArrivalIdentity;
-use transport::claim::{NoNativeClaim, ResourceClaim};
+use postgresql::{Client, Insert, Session};
+use sql::{Dialect, Literal, POSTGRESQL};
 use transport::error::{Result, protocol_error};
-use transport::listening::{Accepting, Listening};
-use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
+use transport::pool::alive;
 use transport::socket;
-use transport::sql::{COLUMN, Column, ENCODING, accept, destination};
-use transport::{Arrived, Configured, Directions, Pool, Taken, Transport};
+use transport::sql::accept::ACCEPT;
+use transport::sql::{
+    COLUMN, DATABASE, ENCODING, Probe, QUERY, Rows, SqlTransport, TIMEOUT, USER, Wire,
+};
+use transport::{Login, Taken};
+use xcore::settings::Settings;
 
-use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
+/// A Location over a `PostgreSQL` server.
+pub type PostgresTransport = SqlTransport<PostgreSql>;
 
-/// The schemes a send target may open with.
-const SCHEMES: &[&str] = &["postgresql", "postgres"];
+/// `PostgreSQL`'s wire: `xmip-core-library-postgresql`'s client, logging in
+/// by trust or a cleartext password.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PostgreSql;
 
-/// What a Receive Location runs unless told otherwise.
-pub const DEFAULT_QUERY: &str = "SELECT id, payload FROM inbox ORDER BY id";
+impl Wire for PostgreSql {
+    type Client = Client;
 
-/// What the loopback pair agrees on: one user logged in by trust to one
-/// database, one table and column the payload is inserted into.
-const LOOPBACK_USER: &str = "probe";
-const LOOPBACK_DATABASE: &str = "probe";
-const LOOPBACK_TARGET: &str = "probe/payload";
-
-#[derive(Clone)]
-pub struct PostgresTransport {
-    /// The secret its Location names, whose password the login presents,
-    /// read at each login (ADR-0019, amendment 2026-10-29).
-    secret: Option<transport::Secured>,
-    server: String,
-    user: String,
-    database: String,
-    password: Option<String>,
-    query: String,
-    /// The statement run on a row's verdict, its name bound in.
-    accept: Option<String>,
-    /// The rows refused and left, not received again while unchanged.
-    /// Cloned, the same memory.
-    refused: accept::RefusedRows,
-    column: Column,
-    timeout: Option<Duration>,
-    /// The connections a send inserts on and a receive queries on, logged
-    /// in once per server and database and kept.
-    connections: Pool<Client>,
-}
-
-impl PostgresTransport {
-    /// Speak to the server at `server` as `user` on `database`.
-    #[must_use]
-    pub fn new(
-        server: impl Into<String>,
-        user: impl Into<String>,
-        database: impl Into<String>,
-    ) -> Self {
-        Self {
-            secret: None,
-            server: server.into(),
-            user: user.into(),
-            database: database.into(),
-            password: None,
-            query: DEFAULT_QUERY.to_string(),
-            accept: None,
-            refused: accept::RefusedRows::default(),
-            column: Column::Binary,
-            timeout: None,
-            connections: Pool::new(),
-        }
-    }
-
-    /// The password to give when the server asks for one in the clear.
-    #[must_use]
-    pub fn with_password(mut self, password: impl Into<String>) -> Self {
-        self.password = Some(password.into());
-        self
-    }
-
-    /// The query a receive runs: the first column is the row's name, the
-    /// last is the Stream.
-    #[must_use]
-    pub fn querying(mut self, query: impl Into<String>) -> Self {
-        self.query = query.into();
-        self
-    }
-
-    /// The statement run once a row's cycle accepted it, the
-    /// row's name in place of `$1` (`transport::sql::accept`).
-    #[must_use]
-    pub fn accepting(mut self, statement: impl Into<String>) -> Self {
-        self.accept = Some(statement.into());
-        self
-    }
-
-    /// What the payload column holds: bytes unless declared otherwise.
-    #[must_use]
-    pub const fn holding(mut self, column: Column) -> Self {
-        self.column = column;
-        self
-    }
-
-    /// Give up on a server that stops mid-message.
-    #[must_use]
-    pub const fn timing_out_after(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
-    /// Log in to the server.
-    ///
-    /// # Errors
-    /// Where the server could not be reached or refused the login.
-    pub fn connect(&self) -> Result<Client> {
-        self.connect_to(&self.server, &self.database)
-    }
-
-    fn connect_to(&self, server: &str, database: &str) -> Result<Client> {
-        let password = match &self.secret {
-            Some(secret) => Some(secret.as_kind(xcore::SecretKind::Password, "postgresql")?),
-            None => self.password.clone(),
-        };
-        Client::connect(
-            server,
-            &self.user,
-            database,
-            password.as_deref(),
-            self.timeout,
-        )
-    }
-
-    /// Bind as the far end clients connect to, and report the address.
-    ///
-    /// # Errors
-    /// Where the address is taken, malformed, or not permitted.
-    pub fn bind(&self) -> Result<(TcpListener, String)> {
-        socket::bind_tcp(&self.server)
-    }
-
-    /// Accept one client on an already-bound listener, demanding this
-    /// transport's password where it has one.
-    ///
-    /// # Errors
-    /// Where the connection could not be accepted or the login failed.
-    pub fn accept_one(&self, listener: &TcpListener) -> Result<Session> {
-        Session::accept(listener, self.password.as_deref(), self.timeout)
-            .map(|session| session.holding(self.column))
-    }
-}
-
-impl Transport for PostgresTransport {
-    fn name(&self) -> &'static str {
-        "postgresql"
-    }
-
-    fn directions(&self) -> Directions {
-        Directions::BOTH
-    }
-
-    fn arrivals(&self) -> transport::Arrivals {
-        transport::Arrivals::Ordered("a poll reads again what is not yet told")
-    }
-
-    fn waiting(&self) -> transport::Waiting {
-        transport::Waiting::Polled("a query runs and returns its rows at once")
-    }
-
-    /// Run the query on the connection kept for the server and database, logged in
-    /// on the first receive; each row is a Stream, whole. Its verdict runs the
-    /// `accept` statement where one is declared — on `Accepted`, never on `Refused`
-    /// or `Failed` — and tells the database nothing where none is: whether a row is
-    /// read again is then the query's (a query that consumes as it reads makes
-    /// acceptance at-most-once).
-    fn receive_up_to(&self, most: usize) -> Result<Vec<Arrived>> {
-        let result = self.connections.exchange(
-            &format!("{}/{}", self.server, self.database),
-            || self.connect(),
-            |client| client.query(&self.query),
-        )?;
-        let shared = Arc::new(self.clone());
-        accept::arrivals(
-            result.rows,
-            most,
-            &self.refused,
-            |name| format!("postgresql://{}/{}?row={name}", self.server, self.database),
-            Clone::clone,
-            |value| self.column.bytes(&value, &POSTGRESQL),
-            |name| {
-                let transport = Arc::clone(&shared);
-                accept::accepting(&POSTGRESQL, self.accept.as_deref(), name, move |sql| {
-                    transport.connections.exchange(
-                        &format!("{}/{}", transport.server, transport.database),
-                        || transport.connect(),
-                        |client| client.execute(sql).map(|_| ()),
-                    )
-                })
-            },
-        )
-    }
-
-    fn sending(&self) -> transport::Sending {
-        transport::Sending::Gathered("an INSERT carries the body as one literal in its statement")
-    }
-
-    /// Insert the bytes as one column of one row: in the bytea hex form,
-    /// or as text where the column is declared to hold it — on the
-    /// connection kept for the server and database, logged in on the first
-    /// send to them.
-    fn send_from(&self, target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
-        let bytes: &[u8] = &outgoing.gather()?;
-        let to = destination(SCHEMES, target, &self.server, &self.database)?;
-        let literal = self.column.literal(bytes, &POSTGRESQL)?;
-        let insert = POSTGRESQL.insert(to.table, to.column, &literal);
-        self.connections.exchange(
-            &format!("{}/{}", to.server, to.database),
-            || self.connect_to(to.server, to.database),
-            |client| client.execute(&insert).map(|_| ()),
-        )
-    }
-
-    /// Rows are artifacts, and the simple flow holds no transaction to
-    /// claim one in.
-    fn claims(&self) -> Option<&dyn ResourceClaim> {
-        Some(&NoNativeClaim)
-    }
-}
-
-impl Configured for PostgresTransport {
-    /// The password the Location's secret holds, read at each login.
-    fn secured_by(mut self, secret: transport::Secured) -> Result<Self> {
-        self.secret = Some(secret);
-        Ok(self)
-    }
-
-    /// The address is the server's host and port: where a Location connects.
+    const NAME: &'static str = "postgresql";
+    const SCHEMES: &'static [&'static str] = &["postgresql", "postgres"];
+    /// The address is the server's host and port: where a Location
+    /// connects.
     const SETTINGS: &'static Settings = &Settings {
         technology: env!("CARGO_PKG_NAME"),
-        settings: &[
-            Setting {
-                name: "user",
-                kind: Kind::Text,
-                presence: Presence::Required,
-                meaning: "The user a Location logs in as.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "database",
-                kind: Kind::Text,
-                presence: Presence::Required,
-                meaning: "The database a Location logs in to and reads or inserts into.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "query",
-                kind: Kind::Text,
-                presence: Presence::Default(Fixed::Text(DEFAULT_QUERY)),
-                meaning: "The query a receive runs: the first column names the row, the last \
-                          is the Stream.",
-                applies: Applies::Receive,
-            },
-            accept::ACCEPT,
-            COLUMN,
-            ENCODING,
-            Setting {
-                name: "timeout",
-                kind: Kind::Duration,
-                presence: Presence::Optional,
-                meaning: "How long a server that stops mid-message is waited on; unbounded \
-                          when left out.",
-                applies: Applies::Both,
-            },
-        ],
+        settings: &[USER, DATABASE, QUERY, ACCEPT, COLUMN, ENCODING, TIMEOUT],
+    };
+    /// One user logged in by trust.
+    const PROBE: Probe = Probe {
+        database: "probe",
+        user: "probe",
+        password: "",
+        target: "probe/payload",
     };
 
-    /// The schemes a Location's address is entered with to choose this technology.
-    const SCHEMES: &'static [&'static str] = SCHEMES;
-
-    /// The password is the secret the Location names, never a
-    /// setting.
-    fn configured(address: &str, settings: &Read) -> Result<Self> {
-        let mut transport = Self::new(address, settings.text("user"), settings.text("database"));
-        if let Some(query) = settings.optional_text("query") {
-            transport = transport.querying(query);
-        }
-        if let Some(statement) = settings.optional_text(accept::ACCEPT.name) {
-            transport = transport.accepting(statement);
-        }
-        if let Some(timeout) = settings.optional_duration("timeout") {
-            transport = transport.timing_out_after(timeout);
-        }
-        Ok(transport.holding(Column::configured(settings)?))
+    fn dialect() -> &'static Dialect {
+        &POSTGRESQL
     }
-}
 
-impl PostgresTransport {
-    /// Both ends on this machine: an ephemeral local port, a login by
-    /// trust, the loopback timeout.
-    #[must_use]
-    pub fn loopback() -> Self {
-        Self::new("127.0.0.1:0", LOOPBACK_USER, LOOPBACK_DATABASE)
-            .timing_out_after(LOOPBACK_TIMEOUT)
+    /// The password given where the server asks for one in the clear; none
+    /// where the login carries none.
+    fn connect(
+        &self,
+        server: &str,
+        database: &str,
+        login: &Login,
+        timeout: Option<Duration>,
+    ) -> Result<Client> {
+        let password = (!login.password.is_empty()).then_some(login.password.as_str());
+        Ok(Client::connect(
+            server,
+            &login.user,
+            database,
+            password,
+            timeout,
+        )?)
     }
-}
 
-impl Accepting for PostgresTransport {
-    fn take_one(self, listener: &TcpListener) -> Result<Taken> {
-        // The client keeps its connection for the next insert.
-        self.accept_one(listener)?
+    /// While the server has not closed the connection. Each statement runs
+    /// in the simple query flow and ends at `ReadyForQuery`, so nothing of
+    /// one is left for the next.
+    fn usable(client: &mut Client) -> bool {
+        alive(client.socket())
+    }
+
+    fn query(client: &mut Client, sql: &str) -> Result<Rows<String>> {
+        Ok(client.query(sql)?.rows)
+    }
+
+    fn execute(client: &mut Client, sql: &str) -> Result<()> {
+        client.execute(sql)?;
+        Ok(())
+    }
+
+    /// The client keeps its connection for the next insert.
+    fn take_one(transport: &PostgresTransport, listener: &TcpListener) -> Result<Taken> {
+        let mut session = accept_one(transport, listener)?;
+        let insert = session
             .next_insert()?
-            .ok_or_else(|| protocol_error("the client closed without inserting"))
+            .ok_or_else(|| protocol_error("the client closed without inserting"))?;
+        taken(transport, &session, insert)
     }
 }
 
-impl Loopback for PostgresTransport {
-    fn arrival_identity(&self) -> ArrivalIdentity {
-        ArrivalIdentity::Unnamed(
-            "a row names no sender: the database it was read from is in its origin",
-        )
-    }
+/// Accept one client on a listener `transport` bound, demanding its
+/// password in the clear where it has one, by trust where it has none.
+///
+/// # Errors
+/// Where the connection could not be accepted or the login failed.
+pub fn accept_one(transport: &PostgresTransport, listener: &TcpListener) -> Result<Session> {
+    let (stream, _) = socket::accept_tcp(listener, transport.timeout())?;
+    let password = &transport.login().password;
+    Ok(Session::accept(
+        stream,
+        (!password.is_empty()).then_some(password.as_str()),
+    )?)
+}
 
-    fn far_end(&self) -> Result<Box<dyn FarEnd>> {
-        Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
-    }
-
-    /// INSERT the payload as one column of one row, as the column is
-    /// declared to hold it, from a fresh near end logging in to
-    /// `address` as this transport does.
-    fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
-        let near = Self {
-            server: address.to_string(),
-            ..self.clone()
-        };
-        near.send(LOOPBACK_TARGET, payload)
-    }
+/// The Stream `insert` carries, read from its literal as `transport`'s
+/// column holds it, its origin where `session` received it.
+///
+/// # Errors
+/// A literal that is not what the column is declared to hold.
+pub fn taken(transport: &PostgresTransport, session: &Session, insert: Insert) -> Result<Taken> {
+    let bytes = match insert.literal {
+        Literal::Text(value) => transport.column().bytes(&value, &POSTGRESQL)?,
+        Literal::Bytes(bytes) => bytes,
+    };
+    Ok(PostgresTransport::inserted(
+        session.peer(),
+        session.database(),
+        &insert.table,
+        &insert.column,
+        bytes,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use codec::unicode::Form;
+    use postgresql::Event;
+    use postgresql::backend::{Backend, encode_backend};
+    use postgresql::wire::{AUTH_CLEARTEXT, AUTH_SASL};
     use std::assert_matches;
     use transport::error::TransportError;
     use transport::payload::edge_payloads;
+    use transport::sql::{Column, DEFAULT_QUERY};
+    use transport::{Arrived, Configured, Loopback, Transport};
+    use xcore::settings::Applies;
 
     /// The bytes 0xff 0xfe as a bytea column answers them.
     const HEX_FFFE: &str = "\\xfffe";
@@ -408,44 +182,25 @@ mod tests {
         Duration::from_secs(n)
     }
 
+    /// The next Stream the client inserts on `session`, as `far_end`'s
+    /// column reads it.
+    fn next_taken(far_end: &PostgresTransport, session: &mut Session) -> Taken {
+        let insert = session.next_insert().expect("insert").expect("one");
+        taken(far_end, session, insert).expect("the column's form")
+    }
+
     #[test]
     fn postgresql_declares_its_settings_and_reads_through_them() {
         use xcore::settings::Given;
         assert_eq!(PostgresTransport::SETTINGS.problems(), Vec::<String>::new());
         let text = |name: &str, value: &str| (name.to_string(), Given::Text(value.to_string()));
-        let given = [
-            text("user", "xmip"),
-            text("database", "orders"),
-            text("timeout", "2s"),
-        ];
+        let given = [text("user", "xmip"), text("database", "orders")];
         let built = PostgresTransport::open("db:5432", Applies::Receive, &given).expect("built");
-        assert_eq!(built.server, "db:5432");
-        assert_eq!(built.user, "xmip");
-        assert_eq!(built.database, "orders");
-        assert_eq!(built.query, DEFAULT_QUERY);
-        assert_eq!(built.accept, None, "nothing runs unless declared");
-        assert_eq!(built.password, None);
-        assert_eq!(built.timeout, Some(secs(2)));
-        assert_eq!(built.column, Column::Binary, "bytes unless declared");
-        let texts = [
-            text("user", "xmip"),
-            text("database", "orders"),
-            text("column", "text"),
-            text("encoding", "utf-16le"),
-        ];
-        let built = PostgresTransport::open("db:5432", Applies::Send, &texts).expect("text");
-        assert_eq!(built.column, Column::Text(Form::Utf16Le));
-        let accepting = [
-            text("user", "xmip"),
-            text("database", "orders"),
-            text("accept", "DELETE FROM inbox WHERE id = $1"),
-        ];
-        let built =
-            PostgresTransport::open("db:5432", Applies::Receive, &accepting).expect("accept");
-        assert_eq!(
-            built.accept.as_deref(),
-            Some("DELETE FROM inbox WHERE id = $1")
-        );
+        assert_eq!((built.server(), built.database()), ("db:5432", "orders"));
+        assert_eq!(built.login().user, "xmip");
+        assert!(built.login().password.is_empty(), "the secret's, by trust");
+        assert_eq!(built.query(), DEFAULT_QUERY);
+        assert_eq!(built.name(), "postgresql");
         let Err(refused) = PostgresTransport::open("db:5432", Applies::Send, &given[1..]) else {
             panic!("user is required");
         };
@@ -473,17 +228,16 @@ mod tests {
     #[test]
     fn a_receive_runs_the_query_and_each_row_is_a_stream() {
         let far_end =
-            PostgresTransport::new("127.0.0.1:0", "xmip", "orders").timing_out_after(secs(2));
+            PostgresTransport::new("127.0.0.1:0", "orders", "xmip").timing_out_after(secs(2));
         let (listener, address) = far_end.bind().expect("binding");
         let receiver = std::thread::spawn(move || {
-            let near = PostgresTransport::new(address, "xmip", "orders")
-                .querying("SELECT id, kind, payload FROM inbox ORDER BY id")
+            let near = PostgresTransport::new(address, "orders", "xmip")
+                .with_query("SELECT id, kind, payload FROM inbox ORDER BY id")
                 .holding(Column::Text(Form::Utf8))
                 .timing_out_after(secs(2));
             verdicts(near.receive()?)
         });
-        let mut session = far_end
-            .accept_one(&listener)
+        let mut session = accept_one(&far_end, &listener)
             .expect("accepting")
             .with_table(
                 &["id", "kind", "payload"],
@@ -516,11 +270,11 @@ mod tests {
     #[test]
     fn accept_consumes_an_accepted_row_and_a_refused_one_is_left_unreceived() {
         let far_end =
-            PostgresTransport::new("127.0.0.1:0", "xmip", "orders").timing_out_after(secs(2));
+            PostgresTransport::new("127.0.0.1:0", "orders", "xmip").timing_out_after(secs(2));
         let (listener, address) = far_end.bind().expect("binding");
         let receiver = std::thread::spawn(move || {
-            let near = PostgresTransport::new(address, "xmip", "orders")
-                .accepting("DELETE FROM inbox WHERE id = $1")
+            let near = PostgresTransport::new(address, "orders", "xmip")
+                .with_accept("DELETE FROM inbox WHERE id = $1")
                 .holding(Column::Text(Form::Utf8))
                 .timing_out_after(secs(2));
             let mut arrived = near.receive()?;
@@ -543,8 +297,7 @@ mod tests {
             );
             Ok::<_, TransportError>(())
         });
-        let mut session = far_end
-            .accept_one(&listener)
+        let mut session = accept_one(&far_end, &listener)
             .expect("accepting")
             .with_table(
                 &["id", "payload"],
@@ -573,12 +326,12 @@ mod tests {
 
     #[test]
     fn a_send_inserts_the_stream_as_one_column_and_the_login_is_checked() {
-        let far_end = PostgresTransport::new("127.0.0.1:0", "xmip", "orders")
+        let far_end = PostgresTransport::new("127.0.0.1:0", "orders", "xmip")
             .with_password("secret")
             .timing_out_after(secs(2));
         let (listener, address) = far_end.bind().expect("binding");
         let sender = std::thread::spawn(move || {
-            let near = PostgresTransport::new(address.clone(), "xmip", "orders")
+            let near = PostgresTransport::new(address.clone(), "orders", "xmip")
                 .with_password("secret")
                 .timing_out_after(secs(2));
             near.send(
@@ -588,27 +341,29 @@ mod tests {
             near.send("outbox/body", b"")?;
             near.send(&format!("{address}/orders/inbox/payload"), &[0xff, 0xfe])?;
             let bad_target = near.send("postgres://host/only-one", b"x");
-            let refused = PostgresTransport::new(address, "xmip", "orders")
+            let refused = PostgresTransport::new(address, "orders", "xmip")
                 .with_password("wrong")
                 .timing_out_after(secs(2))
                 .send("inbox/payload", b"x");
             Ok::<_, TransportError>((bad_target, refused))
         });
         // One server and database, so one login for all three inserts.
-        let mut session = far_end.accept_one(&listener).expect("accepting");
-        let first = session.next_insert().expect("first").expect("one");
+        let mut session = accept_one(&far_end, &listener).expect("accepting");
+        let first = next_taken(&far_end, &mut session);
         assert_eq!(first.bytes, b"it's here");
         assert!(first.origin_uri.ends_with("/orders/inbox/payload"));
-        let second = session.next_insert().expect("second").expect("one");
+        let second = next_taken(&far_end, &mut session);
         assert_eq!(second.bytes, [] as [u8; 0]);
         assert!(second.origin_uri.ends_with("/orders/outbox/body"));
-        let binary = session.next_insert().expect("third").expect("one");
+        let binary = next_taken(&far_end, &mut session);
         assert_eq!(
             binary.bytes,
             [0xff, 0xfe],
             "not text, so the bytea hex form"
         );
-        let error = far_end.accept_one(&listener).err().expect("wrong password");
+        let error = accept_one(&far_end, &listener)
+            .err()
+            .expect("wrong password");
         assert!(error.message.contains("password authentication failed"));
         let (bad_target, refused) = sender.join().expect("thread").expect("sending");
         assert!(!bad_target.expect_err("not a column").retryable);
@@ -616,17 +371,16 @@ mod tests {
         assert!(!refused.retryable);
         assert!(refused.message.contains("28P01"));
         assert!(far_end.claims().is_some(), "rows are artifacts");
-        assert_eq!(far_end.name(), "postgresql");
     }
 
     #[test]
     fn a_thousand_inserts_log_in_once_and_a_connection_the_server_closed_is_replaced() {
         const SENDS: usize = 1000;
-        let far_end = PostgresTransport::new("127.0.0.1:0", "xmip", "orders")
+        let far_end = PostgresTransport::new("127.0.0.1:0", "orders", "xmip")
             .with_password("secret")
             .timing_out_after(secs(5));
         let (listener, address) = far_end.bind().expect("binding");
-        let near = PostgresTransport::new(address, "xmip", "orders")
+        let near = PostgresTransport::new(address, "orders", "xmip")
             .with_password("secret")
             .timing_out_after(secs(5));
         let sending = near.clone();
@@ -637,26 +391,26 @@ mod tests {
             sending.send("inbox/payload", b"after the close")
         });
         // One startup and password for every insert: one session accepted.
-        let mut session = far_end.accept_one(&listener).expect("accepting");
+        let mut session = accept_one(&far_end, &listener).expect("accepting");
         for n in 0..SENDS {
-            let inserted = session.next_insert().expect("insert").expect("one");
+            let inserted = next_taken(&far_end, &mut session);
             assert_eq!(inserted.bytes, n.to_string().as_bytes());
         }
         drop(session);
-        let mut again = far_end.accept_one(&listener).expect("a new login");
-        let last = again.next_insert().expect("insert").expect("one");
+        let mut again = accept_one(&far_end, &listener).expect("a new login");
+        let last = next_taken(&far_end, &mut again);
         assert_eq!(last.bytes, b"after the close");
         sender.join().expect("thread").expect("sending");
-        assert_eq!(near.connections.opened(), 2);
+        assert_eq!(near.opened(), 2);
     }
 
     #[test]
     fn a_thousand_receives_log_in_once_and_a_connection_the_server_closed_is_replaced() {
         const RECEIVES: usize = 1000;
         let far_end =
-            PostgresTransport::new("127.0.0.1:0", "xmip", "orders").timing_out_after(secs(5));
+            PostgresTransport::new("127.0.0.1:0", "orders", "xmip").timing_out_after(secs(5));
         let (listener, address) = far_end.bind().expect("binding");
-        let near = PostgresTransport::new(address, "xmip", "orders").timing_out_after(secs(5));
+        let near = PostgresTransport::new(address, "orders", "xmip").timing_out_after(secs(5));
         let receiving = near.clone();
         let receiver = std::thread::spawn(move || {
             for _ in 0..RECEIVES {
@@ -665,8 +419,7 @@ mod tests {
             receiving.receive()
         });
         let accept = || {
-            far_end
-                .accept_one(&listener)
+            accept_one(&far_end, &listener)
                 .expect("a login")
                 .with_table(&["id", "payload"], &[&[Some("1"), None]])
         };
@@ -680,31 +433,29 @@ mod tests {
         let mut again = accept();
         assert_matches!(again.next_event(), Ok(Some(Event::Selected(_))));
         assert_eq!(receiver.join().expect("thread").expect("after").len(), 1);
-        assert_eq!(near.connections.opened(), 2);
+        assert_eq!(near.opened(), 2);
     }
 
     #[test]
     fn a_binary_column_reads_the_hex_form_and_refuses_what_is_not() {
         let far_end =
-            PostgresTransport::new("127.0.0.1:0", "xmip", "orders").timing_out_after(secs(2));
+            PostgresTransport::new("127.0.0.1:0", "orders", "xmip").timing_out_after(secs(2));
         let (listener, address) = far_end.bind().expect("binding");
         let receiver = std::thread::spawn(move || {
             // Two transports, so two sessions: each keeps its own.
             let near = || {
-                PostgresTransport::new(address.clone(), "xmip", "orders").timing_out_after(secs(2))
+                PostgresTransport::new(address.clone(), "orders", "xmip").timing_out_after(secs(2))
             };
             let bytes = near().receive().and_then(verdicts);
             (bytes, near().receive().and_then(verdicts))
         });
         let rows: [&[Option<&str>]; 1] = [&[Some("1"), Some(HEX_FFFE)]];
-        let mut session = far_end
-            .accept_one(&listener)
+        let mut session = accept_one(&far_end, &listener)
             .expect("first")
             .with_table(&["id", "payload"], &rows);
         while session.next_event().expect("event").is_some() {}
         let text: [&[Option<&str>]; 1] = [&[Some("2"), Some("ISA*00*")]];
-        let mut session = far_end
-            .accept_one(&listener)
+        let mut session = accept_one(&far_end, &listener)
             .expect("second")
             .with_table(&["id", "payload"], &text);
         while session.next_event().expect("event").is_some() {}
@@ -719,30 +470,14 @@ mod tests {
     }
 
     #[test]
-    fn a_text_column_refuses_a_stream_that_is_not_its_encoding() {
-        let near = PostgresTransport::new("127.0.0.1:1", "xmip", "orders")
-            .holding(Column::Text(Form::Utf8));
-        let refused = near
-            .send("inbox/payload", &[0xff, 0xfe])
-            .expect_err("not UTF-8");
-        assert!(!refused.retryable);
-        assert!(
-            refused.message.contains("utf-8 text"),
-            "{}",
-            refused.message
-        );
-    }
-
-    #[test]
     fn a_server_asking_for_scram_or_speaking_nonsense_is_refused() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let address = listener.local_addr().expect("address").to_string();
         std::thread::spawn(move || {
-            let asking =
-                |method| backend::encode_backend(&backend::Backend::Authentication(method));
+            let asking = |method| encode_backend(&Backend::Authentication(method));
             for answer in [
-                &asking(wire::AUTH_SASL)[..],
-                &asking(wire::AUTH_CLEARTEXT)[..],
+                &asking(AUTH_SASL)[..],
+                &asking(AUTH_CLEARTEXT)[..],
                 b"HTTP/1.1 400 Bad Request\r\n\r\n",
             ] {
                 let (mut stream, _) = listener.accept().expect("accept");
@@ -752,7 +487,7 @@ mod tests {
                 let _ = std::io::Read::read(&mut stream, &mut sink);
             }
         });
-        let near = PostgresTransport::new(address, "xmip", "orders").timing_out_after(secs(2));
+        let near = PostgresTransport::new(address, "orders", "xmip").timing_out_after(secs(2));
         let error = near.connect().err().expect("SCRAM");
         assert!(!error.retryable);
         assert!(error.message.contains("SCRAM"));

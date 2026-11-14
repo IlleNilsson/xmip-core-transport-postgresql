@@ -13,8 +13,9 @@
 use std::assert_matches;
 use std::time::{Duration, Instant};
 
+use postgresql::Event;
 use transport::Transport;
-use xmip_core_transport_postgresql::{Event, PostgresTransport};
+use xmip_core_transport_postgresql::{PostgresTransport, accept_one, taken};
 
 fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
@@ -23,11 +24,11 @@ fn secs(n: u64) -> Duration {
 #[test]
 fn a_thousand_inserts_take_a_millisecond_each_at_most() {
     const SENDS: usize = 1000;
-    let far_end = PostgresTransport::new("127.0.0.1:0", "xmip", "orders")
+    let far_end = PostgresTransport::new("127.0.0.1:0", "orders", "xmip")
         .with_password("secret")
         .timing_out_after(secs(5));
     let (listener, address) = far_end.bind().expect("binding");
-    let near = PostgresTransport::new(address, "xmip", "orders")
+    let near = PostgresTransport::new(address, "orders", "xmip")
         .with_password("secret")
         .timing_out_after(secs(5));
     let sender = std::thread::spawn(move || {
@@ -40,9 +41,10 @@ fn a_thousand_inserts_take_a_millisecond_each_at_most() {
         assert!(took < Duration::from_millis(SENDS as u64), "{took:?}");
         Ok::<_, transport::TransportError>(())
     });
-    let mut session = far_end.accept_one(&listener).expect("accepting");
+    let mut session = accept_one(&far_end, &listener).expect("accepting");
     for n in 0..SENDS {
-        let inserted = session.next_insert().expect("insert").expect("one");
+        let insert = session.next_insert().expect("insert").expect("one");
+        let inserted = taken(&far_end, &session, insert).expect("the column's form");
         assert_eq!(inserted.bytes, n.to_string().as_bytes());
     }
     sender.join().expect("thread").expect("sending");
@@ -51,9 +53,9 @@ fn a_thousand_inserts_take_a_millisecond_each_at_most() {
 #[test]
 fn a_thousand_receives_take_a_millisecond_a_query_at_most() {
     const RECEIVES: usize = 1000;
-    let far_end = PostgresTransport::new("127.0.0.1:0", "xmip", "orders").timing_out_after(secs(5));
+    let far_end = PostgresTransport::new("127.0.0.1:0", "orders", "xmip").timing_out_after(secs(5));
     let (listener, address) = far_end.bind().expect("binding");
-    let near = PostgresTransport::new(address, "xmip", "orders").timing_out_after(secs(5));
+    let near = PostgresTransport::new(address, "orders", "xmip").timing_out_after(secs(5));
     let receiver = std::thread::spawn(move || {
         let began = Instant::now();
         for _ in 0..RECEIVES {
@@ -64,8 +66,7 @@ fn a_thousand_receives_take_a_millisecond_a_query_at_most() {
         assert!(took < Duration::from_millis(RECEIVES as u64), "{took:?}");
         Ok::<_, transport::TransportError>(())
     });
-    let mut session = far_end
-        .accept_one(&listener)
+    let mut session = accept_one(&far_end, &listener)
         .expect("a login")
         .with_table(&["id", "payload"], &[&[Some("1"), None]]);
     for _ in 0..RECEIVES {

@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/IlleNilsson/xmip-core-transport-postgresql"
-description = "PostgreSQL transport: the frontend/backend protocol 3.0 in its simple query flow — a Receive Location runs a query and each row is a Stream, a Send Location inserts a Stream as a row; trust and cleartext login. A xmip-core-transport technology."
+description = "PostgreSQL transport: a Receive Location runs a query and each row is a Stream, a Send Location inserts a Stream as a row, over xmip-core-library-postgresql's frontend/backend protocol 3.0; trust and cleartext login. A xmip-core-transport technology."
 publish = false
 
 [lib]
@@ -15,21 +15,17 @@ path = "src/lib.rs"
 
 [dependencies]
 # A Technology depends on its parent Capability, never the reverse
-# (repository-model.md). The protocol is a type byte, a length and text.
+# (repository-model.md).
 transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main" }
 # The settings this technology declares (xcore::settings), read through
 # transport::Configured (ADR-0064, amendment 2026-09-26).
 xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
-# The estate's encoding primitives: the byte cursor and writer the fields
-# are read and written over.
-codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main" }
+# The protocol, both halves: the client a Location logs in, queries and
+# inserts with, and the far end its tests and loopback serve.
+postgresql = { package = "xmip-core-library-postgresql", git = "https://github.com/IlleNilsson/xmip-core-library-postgresql", branch = "main" }
 # SQL: the PostgreSQL dialect this server speaks — its literals, the bytea
-# hex form, the INSERT a send writes and a far end takes apart, and a
-# statement's verb.
+# hex form, the INSERT a send writes.
 sql = { package = "xmip-core-library-sql", git = "https://github.com/IlleNilsson/xmip-core-library-sql", branch = "main" }
-# The most a connection is read for: the ceiling a message's length is
-# held to (`net::MAX_BODY`).
-net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main" }
 
 # The module's timing program (doc/governance/rust-style.md section 5c): a
 # plain cargo test leaves it out, and the landing runs it after every other
@@ -43,6 +39,8 @@ test = false
 # The loopback payloads the tests drive, from the capability's test
 # support and never a production build (ADR-0044).
 transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main", features = ["test-support"] }
+# The Unicode forms a text column's tests name.
+codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main" }
 
 [lints.rust]
 unsafe_code = "forbid"
