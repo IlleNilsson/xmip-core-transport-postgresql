@@ -27,7 +27,7 @@
 //! **The protocol is `xmip-core-library-postgresql`'s**: the
 //! frontend/backend protocol, version 3.0, in its simple query flow, on
 //! port 5432 — startup, trust or a cleartext password, `Query`, rows as
-//! text, `Terminate` — and the far end the tests and the Essentials serve.
+//! text, `Terminate` — and the far end the tests and the System Tests serve.
 //! MD5 and SCRAM are not implemented and a server that asks for them is
 //! told so; TLS is the transport capability's, per ADR-0033.
 //!
