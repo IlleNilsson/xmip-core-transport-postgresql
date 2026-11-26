@@ -36,41 +36,50 @@
 //! `postgresql://host:5432/<database>/<table>/<column>`,
 //! `host:5432/<database>/<table>/<column>`, or `<table>/<column>` on the
 //! configured server and database.
+//!
+//! **Built with its `declaration` feature alone** the crate is
+//! [`declaration`], what a Location of it is configured with, and none of
+//! the code above, which is behind the default feature: what the surfaces'
+//! library carries (ADR-0064, amendment 2026-11-26).
 
+#[cfg(feature = "declaration")]
+pub mod declaration;
+
+#[cfg(feature = "default")]
 use std::net::TcpListener;
+#[cfg(feature = "default")]
 use std::time::Duration;
 
+#[cfg(feature = "default")]
 use postgresql::{Client, Insert, Session};
+#[cfg(feature = "default")]
 use sql::{Dialect, Literal, POSTGRESQL};
+#[cfg(feature = "default")]
 use transport::error::{Result, protocol_error};
-use transport::pool::alive;
-use transport::socket;
-use transport::sql::accept::ACCEPT;
-use transport::sql::{
-    COLUMN, DATABASE, ENCODING, Probe, QUERY, Rows, SqlTransport, TIMEOUT, USER, Wire,
-};
-use transport::{Login, Taken};
+#[cfg(feature = "default")]
+use transport::sql::{Probe, Rows, SqlTransport, Wire};
+#[cfg(feature = "default")]
+use transport::{Login, Taken, pool::alive, socket};
+#[cfg(feature = "default")]
 use xcore::settings::Settings;
 
 /// A Location over a `PostgreSQL` server.
+#[cfg(feature = "default")]
 pub type PostgresTransport = SqlTransport<PostgreSql>;
 
 /// `PostgreSQL`'s wire: `xmip-core-library-postgresql`'s client, logging in
 /// by trust or a cleartext password.
+#[cfg(feature = "default")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PostgreSql;
 
+#[cfg(feature = "default")]
 impl Wire for PostgreSql {
     type Client = Client;
 
     const NAME: &'static str = "postgresql";
-    const SCHEMES: &'static [&'static str] = &["postgresql", "postgres"];
-    /// The address is the server's host and port: where a Location
-    /// connects.
-    const SETTINGS: &'static Settings = &Settings {
-        technology: env!("CARGO_PKG_NAME"),
-        settings: &[USER, DATABASE, QUERY, ACCEPT, COLUMN, ENCODING, TIMEOUT],
-    };
+    const SCHEMES: &'static [&'static str] = declaration::SCHEMES;
+    const SETTINGS: &'static Settings = declaration::SETTINGS;
     /// One user logged in by trust.
     const PROBE: Probe = Probe {
         database: "probe",
@@ -133,6 +142,7 @@ impl Wire for PostgreSql {
 ///
 /// # Errors
 /// Where the connection could not be accepted or the login failed.
+#[cfg(feature = "default")]
 pub fn accept_one(transport: &PostgresTransport, listener: &TcpListener) -> Result<Session> {
     let (stream, _) = socket::accept_tcp(listener, transport.timeout())?;
     let password = &transport.login().password;
@@ -147,6 +157,7 @@ pub fn accept_one(transport: &PostgresTransport, listener: &TcpListener) -> Resu
 ///
 /// # Errors
 /// A literal that is not what the column is declared to hold.
+#[cfg(feature = "default")]
 pub fn taken(transport: &PostgresTransport, session: &Session, insert: Insert) -> Result<Taken> {
     let bytes = match insert.literal {
         Literal::Text(value) => transport.column().bytes(&value, &POSTGRESQL)?,
