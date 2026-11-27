@@ -1,11 +1,11 @@
 [package]
 name = "xmip-core-transport-postgresql"
-version = "0.1.0"
-edition = "2024"
-license = "AGPL-3.0-or-later"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 repository = "https://github.com/IlleNilsson/xmip-core-transport-postgresql"
 description = "PostgreSQL transport: a Receive Location runs a query and each row is a Stream, a Send Location inserts a Stream as a row, over xmip-core-library-postgresql's frontend/backend protocol 3.0; trust and cleartext login. A xmip-core-transport technology."
-publish = false
+publish.workspace = true
 
 [lib]
 path = "src/lib.rs"
@@ -47,13 +47,5 @@ transport = { package = "xmip-core-transport", git = "https://github.com/IlleNil
 # The Unicode forms a text column's tests name.
 codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main" }
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-too_many_lines = "warn"
-pedantic = { level = "warn", priority = -1 }
-missing_errors_doc = "warn"
-missing_panics_doc = "warn"
-unwrap_used = "warn"
-expect_used = "allow"
+[lints]
+workspace = true
